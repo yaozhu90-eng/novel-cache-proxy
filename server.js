@@ -3,13 +3,10 @@ import http from "node:http";
 import crypto from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
-
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
-
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
-
 const DIAG = process.env.CACHE_DIAGNOSTICS === "true";
 
 function sendJSON(res, status, data) {
@@ -17,7 +14,6 @@ function sendJSON(res, status, data) {
     "Content-Type": "application/json; charset=utf-8",
     "Cache-Control": "no-store"
   });
-
   res.end(JSON.stringify(data));
 }
 
@@ -27,10 +23,8 @@ function isAuthorized(req) {
   const a = Buffer.from(req.headers.authorization || "");
   const b = Buffer.from(`Bearer ${PROXY_PASSWORD}`);
 
-  return (
-    a.length === b.length &&
-    crypto.timingSafeEqual(a, b)
-  );
+  return a.length === b.length &&
+    crypto.timingSafeEqual(a, b);
 }
 
 function makeSessionId(body) {
@@ -45,12 +39,12 @@ function makeSessionId(body) {
     ? body.messages
     : [];
 
-  const index = messages.findIndex(
-    m => m && m.role === "user"
+  const firstUser = messages.findIndex(
+    m => m?.role === "user"
   );
 
-  const initialMessages = index >= 0
-    ? messages.slice(0, index + 1)
+  const initialMessages = firstUser >= 0
+    ? messages.slice(0, firstUser + 1)
     : messages.slice(0, 1);
 
   const identity = JSON.stringify({
@@ -94,88 +88,113 @@ async function readJSONBody(req) {
   }
 }
 
-// 将最后一个可缓存的用户文本消息
-// 转换为 OpenRouter 显式缓存断点
-function addExplicitCacheBreakpoint(body) {
-  const messages = body.messages;
+function clearBreakpoints(messages) {
+  for (const message of messages) {
+    if (!Array.isArray(message?.content)) continue;
 
-  // 从后往前找到最后一条有文本的用户消息
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const message = messages[i];
-
-    if (!message || message.role !== "user") {
-      continue;
+    for (const part of message.content) {
+      if (part && typeof part === "object") {
+        delete part.prompt_cache_breakpoint;
+      }
     }
+  }
+}
 
-    // Cherry Studio 常见的字符串消息
-    if (
-      typeof message.content === "string" &&
-      message.content.length > 0
+function markMessage(messages, index) {
+  const message = messages[index];
+  if (!message) return false;
+
+  const marker = {
+    mode: "explicit",
+    ttl: "12h"
+  };
+
+  if (
+    typeof message.content === "string" &&
+    message.content.length > 0
+  ) {
+    message.content = [{
+      type: "text",
+      text: message.content,
+      prompt_cache_breakpoint: marker
+    }];
+
+    return true;
+  }
+
+  if (Array.isArray(message.content)) {
+    for (
+      let j = message.content.length - 1;
+      j >= 0;
+      j--
     ) {
-      message.content = [
-        {
-          type: "text",
-          text: message.content,
-          prompt_cache_breakpoint: {
-            mode: "explicit"
-          }
-        }
-      ];
+      const part = message.content[j];
 
-      return {
-        added: true,
-        message_index: i
-      };
-    }
-
-    // 已经是多内容块的消息
-    if (Array.isArray(message.content)) {
-      for (
-        let j = message.content.length - 1;
-        j >= 0;
-        j--
+      if (
+        part?.type === "text" &&
+        typeof part.text === "string" &&
+        part.text.length > 0
       ) {
-        const part = message.content[j];
+        message.content[j] = {
+          ...part,
+          prompt_cache_breakpoint: marker
+        };
 
-        if (
-          part &&
-          part.type === "text" &&
-          typeof part.text === "string" &&
-          part.text.length > 0
-        ) {
-          message.content[j] = {
-            ...part,
-            prompt_cache_breakpoint: {
-              mode: "explicit"
-            }
-          };
-
-          return {
-            added: true,
-            message_index: i
-          };
-        }
+        return true;
       }
     }
   }
 
-  return {
-    added: false,
-    message_index: null
-  };
+  return false;
 }
 
-// 只记录安全的诊断信息，不记录聊天正文
-function makeSafeRequestLog(body, traceId) {
-  let breakpointCount = 0;
+// 核心：上一轮 + 当前轮。
+// 每一轮都保留上次写入的完整前缀边界，
+// 同时在本轮末尾建立新的 12 小时缓存。
+function configureCache(body) {
+  clearBreakpoints(body.messages);
 
-  const messages = body.messages.map(message => {
+  body.prompt_cache_options = {
+    mode: "explicit",
+    ttl: "12h"
+  };
+
+  const indexes = [];
+
+  for (let i = 0; i < body.messages.length; i++) {
+    if (body.messages[i]?.role === "user") {
+      indexes.push(i);
+    }
+  }
+
+  const marked = [];
+
+  const candidates = indexes.slice(-2);
+
+  for (const index of candidates) {
+    if (markMessage(body.messages, index)) {
+      marked.push(index);
+    }
+  }
+
+  return marked;
+}
+
+// 日志只记录参数和消息类型，不记录聊天正文。
+function makeSafeRequestLog(body, traceId) {
+  const breakpoints = [];
+
+  const messages = body.messages.map((message, index) => {
     const content = message?.content;
 
     if (Array.isArray(content)) {
       for (const part of content) {
         if (part?.prompt_cache_breakpoint) {
-          breakpointCount++;
+          breakpoints.push({
+            message_index: index,
+            mode: part.prompt_cache_breakpoint.mode,
+            ttl: part.prompt_cache_breakpoint.ttl
+          });
         }
       }
     }
@@ -198,9 +217,10 @@ function makeSafeRequestLog(body, traceId) {
     stream: body.stream === true,
     stream_options: body.stream_options,
     prompt_cache_options: body.prompt_cache_options,
-    prompt_cache_breakpoint_count: breakpointCount,
     session_id_present:
       typeof body.session_id === "string",
+    prompt_cache_breakpoint_count: breakpoints.length,
+    breakpoints,
     messages
   };
 }
@@ -294,7 +314,7 @@ async function forwardRequest(req, res, path, body) {
     for await (const chunk of upstream.body) {
       if (res.destroyed) break;
 
-      // 原样转发响应给 Cherry Studio
+      // 原样转发给 Cherry Studio
       res.write(chunk);
 
       if (!DIAG || !isChat || diagnosticsStopped) {
@@ -361,12 +381,16 @@ const server = http.createServer(async (req, res) => {
       "http://localhost"
     ).pathname;
 
-    if (path === "/health" && req.method === "GET") {
+    if (
+      path === "/health" &&
+      req.method === "GET"
+    ) {
       return sendJSON(res, 200, {
         status: "ok",
         service: "cherry-cache-proxy",
         requested_prompt_cache_ttl: "12h",
         cache_mode: "explicit",
+        cache_strategy: "previous-and-current",
         diagnostics_enabled: DIAG
       });
     }
@@ -416,29 +440,24 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // 保持会话标识稳定
+      // 稳定会话 ID。
       body.session_id = makeSessionId(body);
 
-      // 启用 OpenAI 12 小时显式缓存
-      body.prompt_cache_options = {
-        mode: "explicit",
-        ttl: "12h"
-      };
-
-      // 添加显式缓存断点
-      const breakpoint = addExplicitCacheBreakpoint(body);
+      // 保留上一轮断点，新增本轮断点。
+      const marked = configureCache(body);
 
       if (DIAG) {
         console.log(
           "CACHE_DIAG_BREAKPOINT",
           JSON.stringify({
-            added: breakpoint.added,
-            message_index: breakpoint.message_index
+            strategy: "previous-and-current",
+            added: marked.length > 0,
+            count: marked.length,
+            message_indexes: marked
           })
         );
       }
 
-      // 流式响应中返回 usage
       if (body.stream === true) {
         body.stream_options = {
           ...(body.stream_options || {}),
