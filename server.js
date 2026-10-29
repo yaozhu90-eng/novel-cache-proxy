@@ -19,30 +19,18 @@ function sendJSON(res, status, data) {
 
 function isAuthorized(req) {
   if (!PROXY_PASSWORD) return false;
-
   const a = Buffer.from(req.headers.authorization || "");
   const b = Buffer.from(`Bearer ${PROXY_PASSWORD}`);
-
-  return a.length === b.length &&
-    crypto.timingSafeEqual(a, b);
+  return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
 function makeSessionId(body) {
-  if (
-    typeof body.session_id === "string" &&
-    body.session_id.length > 0
-  ) {
+  if (typeof body.session_id === "string" && body.session_id.length > 0) {
     return body.session_id;
   }
 
-  const messages = Array.isArray(body.messages)
-    ? body.messages
-    : [];
-
-  const firstUser = messages.findIndex(
-    m => m?.role === "user"
-  );
-
+  const messages = Array.isArray(body.messages) ? body.messages : [];
+  const firstUser = messages.findIndex(m => m?.role === "user");
   const initialMessages = firstUser >= 0
     ? messages.slice(0, firstUser + 1)
     : messages.slice(0, 1);
@@ -123,11 +111,7 @@ function markMessage(messages, index) {
   }
 
   if (Array.isArray(message.content)) {
-    for (
-      let j = message.content.length - 1;
-      j >= 0;
-      j--
-    ) {
+    for (let j = message.content.length - 1; j >= 0; j--) {
       const part = message.content[j];
 
       if (
@@ -139,7 +123,6 @@ function markMessage(messages, index) {
           ...part,
           prompt_cache_breakpoint: marker
         };
-
         return true;
       }
     }
@@ -148,9 +131,6 @@ function markMessage(messages, index) {
   return false;
 }
 
-// 核心：上一轮 + 当前轮。
-// 每一轮都保留上次写入的完整前缀边界，
-// 同时在本轮末尾建立新的 12 小时缓存。
 function configureCache(body) {
   clearBreakpoints(body.messages);
 
@@ -169,9 +149,8 @@ function configureCache(body) {
 
   const marked = [];
 
-  const candidates = indexes.slice(-2);
-
-  for (const index of candidates) {
+  // 保留上一轮断点，同时标记当前轮断点。
+  for (const index of indexes.slice(-2)) {
     if (markMessage(body.messages, index)) {
       marked.push(index);
     }
@@ -180,7 +159,6 @@ function configureCache(body) {
   return marked;
 }
 
-// 日志只记录参数和消息类型，不记录聊天正文。
 function makeSafeRequestLog(body, traceId) {
   const breakpoints = [];
 
@@ -216,9 +194,10 @@ function makeSafeRequestLog(body, traceId) {
     model: body.model,
     stream: body.stream === true,
     stream_options: body.stream_options,
+    provider: body.provider,
+    model_fallback_present: Object.hasOwn(body, "models"),
     prompt_cache_options: body.prompt_cache_options,
-    session_id_present:
-      typeof body.session_id === "string",
+    session_id_present: typeof body.session_id === "string",
     prompt_cache_breakpoint_count: breakpoints.length,
     breakpoints,
     messages
@@ -236,23 +215,19 @@ async function forwardRequest(req, res, path, body) {
     );
   }
 
-  const upstream = await fetch(
-    `${OPENROUTER_BASE}${path}`,
-    {
-      method: req.method,
-      headers: {
-        Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-        "Content-Type": "application/json"
-      },
-      ...(body !== undefined
-        ? { body: JSON.stringify(body) }
-        : {})
-    }
-  );
+  const upstream = await fetch(`${OPENROUTER_BASE}${path}`, {
+    method: req.method,
+    headers: {
+      Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+      "Content-Type": "application/json"
+    },
+    ...(body !== undefined
+      ? { body: JSON.stringify(body) }
+      : {})
+  });
 
   const contentType =
-    upstream.headers.get("content-type") ||
-    "application/json";
+    upstream.headers.get("content-type") || "application/json";
 
   res.writeHead(upstream.status, {
     "Content-Type": contentType,
@@ -314,7 +289,7 @@ async function forwardRequest(req, res, path, body) {
     for await (const chunk of upstream.body) {
       if (res.destroyed) break;
 
-      // 原样转发给 Cherry Studio
+      // 将上游响应原样转发给 Cherry Studio。
       res.write(chunk);
 
       if (!DIAG || !isChat || diagnosticsStopped) {
@@ -330,12 +305,9 @@ async function forwardRequest(req, res, path, body) {
 
         let boundary;
 
-        while (
-          (boundary = buffer.indexOf("\n\n")) !== -1
-        ) {
+        while ((boundary = buffer.indexOf("\n\n")) !== -1) {
           const eventText = buffer.slice(0, boundary);
           buffer = buffer.slice(boundary + 2);
-
           processSSEEvent(eventText);
         }
 
@@ -381,16 +353,15 @@ const server = http.createServer(async (req, res) => {
       "http://localhost"
     ).pathname;
 
-    if (
-      path === "/health" &&
-      req.method === "GET"
-    ) {
+    if (path === "/health" && req.method === "GET") {
       return sendJSON(res, 200, {
         status: "ok",
         service: "cherry-cache-proxy",
         requested_prompt_cache_ttl: "12h",
         cache_mode: "explicit",
         cache_strategy: "previous-and-current",
+        provider_only: ["openai"],
+        provider_fallbacks: false,
         diagnostics_enabled: DIAG
       });
     }
@@ -407,15 +378,8 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    if (
-      path === "/v1/models" &&
-      req.method === "GET"
-    ) {
-      return await forwardRequest(
-        req,
-        res,
-        "/models"
-      );
+    if (path === "/v1/models" && req.method === "GET") {
+      return await forwardRequest(req, res, "/models");
     }
 
     if (
@@ -440,10 +404,21 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // 稳定会话 ID。
+      // 强制只允许 OpenAI 官方供应商。
+      // 官方不可用时直接报错，不切换其他供应商。
+      body.provider = {
+        only: ["openai"],
+        order: ["openai"],
+        allow_fallbacks: false
+      };
+
+      // 禁止模型级回退。
+      delete body.models;
+
+      // 保持同一对话的稳定 session_id。
       body.session_id = makeSessionId(body);
 
-      // 保留上一轮断点，新增本轮断点。
+      // 保留上一轮 + 当前轮的显式缓存断点。
       const marked = configureCache(body);
 
       if (DIAG) {
@@ -453,7 +428,9 @@ const server = http.createServer(async (req, res) => {
             strategy: "previous-and-current",
             added: marked.length > 0,
             count: marked.length,
-            message_indexes: marked
+            message_indexes: marked,
+            provider_only: ["openai"],
+            provider_fallbacks: false
           })
         );
       }
