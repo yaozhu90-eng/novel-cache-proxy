@@ -1,10 +1,12 @@
 
 import http from "node:http";
+import crypto from "node:crypto";
 
 const PORT = Number(process.env.PORT || 3000);
 const OPENROUTER_API_KEY = process.env.OPENROUTER_API_KEY;
 const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
 
+const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 
 function sendJSON(res, status, data) {
@@ -15,117 +17,219 @@ function sendJSON(res, status, data) {
   res.end(JSON.stringify(data));
 }
 
-const server = http.createServer(async (req, res) => {
-  if (req.url === "/health" && req.method === "GET") {
-    return sendJSON(res, 200, { status: "ok" });
-  }
+function isAuthorized(req) {
+  const header = req.headers.authorization || "";
+  const expected = `Bearer ${PROXY_PASSWORD}`;
 
-  if (!OPENROUTER_API_KEY || !PROXY_PASSWORD) {
-    return sendJSON(res, 503, {
-      error: "Server environment variables are missing"
-    });
-  }
+  if (!PROXY_PASSWORD) return false;
 
-  const password = req.headers.authorization || "";
-  if (password !== `Bearer ${PROXY_PASSWORD}`) {
-    return sendJSON(res, 401, {
-      error: "Unauthorized"
-    });
-  }
+  const a = Buffer.from(header);
+  const b = Buffer.from(expected);
 
-  if (req.url === "/v1/models" && req.method === "GET") {
-    try {
-      const upstream = await fetch(
-        "https://openrouter.ai/api/v1/models",
-        {
-          headers: {
-            Authorization: `Bearer ${OPENROUTER_API_KEY}`
-          }
-        }
-      );
+  return (
+    a.length === b.length &&
+    crypto.timingSafeEqual(a, b)
+  );
+}
 
-      res.writeHead(upstream.status, {
-        "Content-Type": "application/json"
-      });
-      return res.end(await upstream.text());
-    } catch {
-      return sendJSON(res, 502, {
-        error: "OpenRouter connection failed"
-      });
-    }
-  }
-
+function makeSessionId(body) {
+  // Keep an explicitly supplied session ID.
   if (
-    req.url !== "/v1/chat/completions" ||
-    req.method !== "POST"
+    typeof body.session_id === "string" &&
+    body.session_id.length > 0
   ) {
-    return sendJSON(res, 404, {
-      error: "Not found"
-    });
+    return body.session_id;
   }
 
-  let chunks = [];
-  let size = 0;
+  const messages = Array.isArray(body.messages)
+    ? body.messages
+    : [];
+
+  // The first user message normally remains unchanged
+  // throughout a Cherry Studio conversation.
+  const firstUser = messages.find(
+    (message) => message && message.role === "user"
+  );
+
+  // Include the model and initial system messages.
+  const firstUserIndex = messages.indexOf(firstUser);
+  const initialMessages = firstUserIndex >= 0
+    ? messages.slice(0, firstUserIndex + 1)
+    : messages.slice(0, 1);
+
+  const identity = JSON.stringify({
+    model: body.model || "",
+    initialMessages
+  });
+
+  const hash = crypto
+    .createHash("sha256")
+    .update(identity)
+    .digest("hex")
+    .slice(0, 40);
+
+  return `cherry-${hash}`;
+}
+
+async function readJSONBody(req) {
+  const chunks = [];
+  let total = 0;
+
+  for await (const chunk of req) {
+    total += chunk.length;
+
+    if (total > MAX_BODY_BYTES) {
+      const error = new Error("Request body too large");
+      error.status = 413;
+      throw error;
+    }
+
+    chunks.push(chunk);
+  }
 
   try {
-    for await (const chunk of req) {
-      size += chunk.length;
+    return JSON.parse(
+      Buffer.concat(chunks).toString("utf8")
+    );
+  } catch {
+    const error = new Error("Invalid JSON body");
+    error.status = 400;
+    throw error;
+  }
+}
 
-      if (size > MAX_BODY_BYTES) {
-        return sendJSON(res, 413, {
-          error: "Request too large"
+async function forwardRequest(req, res, path, body) {
+  const upstreamHeaders = {
+    Authorization: `Bearer ${OPENROUTER_API_KEY}`,
+    "Content-Type": "application/json"
+  };
+
+  const options = {
+    method: req.method,
+    headers: upstreamHeaders
+  };
+
+  if (body !== undefined) {
+    options.body = JSON.stringify(body);
+  }
+
+  const upstream = await fetch(
+    `${OPENROUTER_BASE}${path}`,
+    options
+  );
+
+  const responseHeaders = {
+    "Content-Type":
+      upstream.headers.get("content-type") ||
+      "application/json",
+    "Cache-Control": "no-store"
+  };
+
+  res.writeHead(upstream.status, responseHeaders);
+
+  if (!upstream.body) {
+    res.end();
+    return;
+  }
+
+  for await (const chunk of upstream.body) {
+    if (res.destroyed) break;
+    res.write(chunk);
+  }
+
+  if (!res.destroyed) {
+    res.end();
+  }
+}
+
+const server = http.createServer(async (req, res) => {
+  try {
+    const path = new URL(
+      req.url,
+      "http://localhost"
+    ).pathname;
+
+    if (path === "/health" && req.method === "GET") {
+      return sendJSON(res, 200, {
+        status: "ok",
+        service: "cherry-cache-proxy"
+      });
+    }
+
+    if (!OPENROUTER_API_KEY || !PROXY_PASSWORD) {
+      return sendJSON(res, 503, {
+        error: "Server environment variables missing"
+      });
+    }
+
+    if (!isAuthorized(req)) {
+      return sendJSON(res, 401, {
+        error: "Unauthorized"
+      });
+    }
+
+    if (path === "/v1/models" && req.method === "GET") {
+      return await forwardRequest(
+        req,
+        res,
+        "/models"
+      );
+    }
+
+    if (
+      path === "/v1/chat/completions" &&
+      req.method === "POST"
+    ) {
+      const body = await readJSONBody(req);
+
+      if (
+        !body ||
+        typeof body !== "object" ||
+        Array.isArray(body)
+      ) {
+        return sendJSON(res, 400, {
+          error: "Request body must be an object"
         });
       }
 
-      chunks.push(chunk);
+      if (!Array.isArray(body.messages)) {
+        return sendJSON(res, 400, {
+          error: "messages must be an array"
+        });
+      }
+
+      // Stable routing helps reuse prompt caches.
+      body.session_id = makeSessionId(body);
+
+      // OpenRouter handles automatic prompt caching
+      // on supported models.
+      //
+      // A 12-hour TTL is NOT forced here because
+      // forwarding support is not yet verified.
+
+      return await forwardRequest(
+        req,
+        res,
+        "/chat/completions",
+        body
+      );
     }
 
-    const body = JSON.parse(Buffer.concat(chunks).toString());
-
-    const upstream = await fetch(
-      "https://openrouter.ai/api/v1/chat/completions",
-      {
-        method: "POST",
-        headers: {
-          Authorization: `Bearer ${OPENROUTER_API_KEY}`,
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify(body)
-      }
-    );
-
-    res.writeHead(upstream.status, {
-      "Content-Type":
-        upstream.headers.get("content-type") ||
-        "application/json",
-      "Cache-Control": "no-store"
+    return sendJSON(res, 404, {
+      error: "Not found"
     });
-
-    if (!upstream.body) {
-      return res.end();
-    }
-
-    for await (const chunk of upstream.body) {
-      if (!res.write(chunk)) {
-        await new Promise(resolve =>
-          res.once("drain", resolve)
-        );
-      }
-    }
-
-    res.end();
   } catch (error) {
+    console.error("Proxy error:", error.message);
+
     if (!res.headersSent) {
-      sendJSON(res, 502, {
-        error: "Proxy request failed"
+      return sendJSON(res, error.status || 502, {
+        error: error.message || "Proxy error"
       });
-    } else {
-      res.destroy();
     }
+
+    res.destroy();
   }
 });
-
-server.requestTimeout = 10 * 60 * 1000;
 
 server.listen(PORT, "0.0.0.0", () => {
   console.log(`Proxy listening on port ${PORT}`);
