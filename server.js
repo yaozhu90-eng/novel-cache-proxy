@@ -35,8 +35,10 @@ function makeSessionId(body) {
     ? messages.slice(0, firstUser + 1)
     : messages.slice(0, 1);
 
+  // 不将模型 ID 纳入哈希。
+  // 同一对话切换普通 OpenAI / Flex 时，
+  // 只要初始消息相同，就生成相同的 session_id。
   const identity = JSON.stringify({
-    model: body.model || "",
     initialMessages
   });
 
