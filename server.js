@@ -152,6 +152,61 @@ function userMessageFingerprint(message) {
     .digest("hex");
 }
 
+// 新增：统一计算 SHA-256，仅用于诊断。
+function sha256(value) {
+  return crypto
+    .createHash("sha256")
+    .update(value)
+    .digest("hex");
+}
+
+// 新增：计算每个断点之前的消息前缀指纹。
+// 不改变 body，也不向上游添加任何字段。
+function makePrefixDiagnostics(body) {
+  const messages = body.messages;
+  const results = [];
+
+  for (let i = 0; i < messages.length; i++) {
+    const content = messages[i]?.content;
+
+    if (!Array.isArray(content)) continue;
+
+    for (let j = 0; j < content.length; j++) {
+      if (!content[j]?.prompt_cache_breakpoint) continue;
+
+      // 截取到实际标记所在的内容片段。
+      // 前面消息完整保留，当前消息只保留到此片段。
+      const prefix = [
+        ...messages.slice(0, i),
+        {
+          ...messages[i],
+          content: content.slice(0, j + 1)
+        }
+      ];
+
+      const exactJSON = JSON.stringify(prefix);
+
+      const withoutMarkersJSON = JSON.stringify(
+        prefix,
+        (key, value) =>
+          key === "prompt_cache_breakpoint"
+            ? undefined
+            : value
+      );
+
+      results.push({
+        message_index: i,
+        part_index: j,
+        prefix_sha256: sha256(exactJSON),
+        prefix_without_markers_sha256:
+          sha256(withoutMarkersJSON)
+      });
+    }
+  }
+
+  return results;
+}
+
 // 不同模型及普通/Flex 分开保存。
 function modelKey(body) {
   return JSON.stringify([
@@ -361,6 +416,19 @@ async function forwardRequest(req, res, path, body) {
     console.log(
       "CACHE_DIAG_REQUEST",
       JSON.stringify(makeSafeRequestLog(body, traceId))
+    );
+
+    // 新增：实际发送给 OpenRouter 的缓存前缀指纹。
+    console.log(
+      "CACHE_DIAG_PREFIX",
+      JSON.stringify({
+        trace_id: traceId,
+        session_id: body.session_id,
+        model: body.model,
+        service_tier: body.service_tier || "default",
+        prefix_hash_algorithm: "sha256",
+        breakpoints: makePrefixDiagnostics(body)
+      })
     );
   }
 
@@ -594,7 +662,6 @@ const server = http.createServer(async (req, res) => {
           key
         );
 
-        // 新增：数据库读取成功日志。
         console.log(
           "CACHE_STATE_LOAD_OK",
           JSON.stringify({
@@ -671,7 +738,6 @@ const server = http.createServer(async (req, res) => {
             }
           );
 
-          // 新增：数据库保存成功日志。
           console.log(
             "CACHE_STATE_SAVE_OK",
             JSON.stringify({
