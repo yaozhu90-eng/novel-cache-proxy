@@ -33,7 +33,6 @@ function isAuthorized(req) {
 }
 
 function makeSessionId(body) {
-  // Keep an explicitly supplied session ID.
   if (
     typeof body.session_id === "string" &&
     body.session_id.length > 0
@@ -45,14 +44,12 @@ function makeSessionId(body) {
     ? body.messages
     : [];
 
-  // The first user message normally remains unchanged
-  // throughout a Cherry Studio conversation.
   const firstUser = messages.find(
     (message) => message && message.role === "user"
   );
 
-  // Include the model and initial system messages.
   const firstUserIndex = messages.indexOf(firstUser);
+
   const initialMessages = firstUserIndex >= 0
     ? messages.slice(0, firstUserIndex + 1)
     : messages.slice(0, 1);
@@ -152,7 +149,8 @@ const server = http.createServer(async (req, res) => {
     if (path === "/health" && req.method === "GET") {
       return sendJSON(res, 200, {
         status: "ok",
-        service: "cherry-cache-proxy"
+        service: "cherry-cache-proxy",
+        requested_prompt_cache_ttl: "12h"
       });
     }
 
@@ -198,14 +196,15 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // Stable routing helps reuse prompt caches.
+      // Keep the same conversation on a stable route.
       body.session_id = makeSessionId(body);
 
-      // OpenRouter handles automatic prompt caching
-      // on supported models.
-      //
-      // A 12-hour TTL is NOT forced here because
-      // forwarding support is not yet verified.
+      // EXPERIMENTAL:
+      // Request a 12-hour prompt cache lifetime.
+      // OpenRouter may ignore this unsupported field.
+      body.prompt_cache_options = {
+        ttl: "12h"
+      };
 
       return await forwardRequest(
         req,
@@ -222,9 +221,13 @@ const server = http.createServer(async (req, res) => {
     console.error("Proxy error:", error.message);
 
     if (!res.headersSent) {
-      return sendJSON(res, error.status || 502, {
-        error: error.message || "Proxy error"
-      });
+      return sendJSON(
+        res,
+        error.status || 502,
+        {
+          error: error.message || "Proxy error"
+        }
+      );
     }
 
     res.destroy();
