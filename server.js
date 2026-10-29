@@ -1,3 +1,4 @@
+
 import http from "node:http";
 import crypto from "node:crypto";
 
@@ -9,7 +10,6 @@ const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 
-// 在 Render 设置 CACHE_DIAGNOSTICS=true 才开启日志
 const DIAG = process.env.CACHE_DIAGNOSTICS === "true";
 
 function sendJSON(res, status, data) {
@@ -94,8 +94,103 @@ async function readJSONBody(req) {
   }
 }
 
-// 生成安全的诊断信息：不包含聊天正文或密钥
+// 将最后一个可缓存的用户文本消息
+// 转换为 OpenRouter 显式缓存断点
+function addExplicitCacheBreakpoint(body) {
+  const messages = body.messages;
+
+  // 从后往前找到最后一条有文本的用户消息
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const message = messages[i];
+
+    if (!message || message.role !== "user") {
+      continue;
+    }
+
+    // Cherry Studio 常见的字符串消息
+    if (
+      typeof message.content === "string" &&
+      message.content.length > 0
+    ) {
+      message.content = [
+        {
+          type: "text",
+          text: message.content,
+          prompt_cache_breakpoint: {
+            mode: "explicit"
+          }
+        }
+      ];
+
+      return {
+        added: true,
+        message_index: i
+      };
+    }
+
+    // 已经是多内容块的消息
+    if (Array.isArray(message.content)) {
+      for (
+        let j = message.content.length - 1;
+        j >= 0;
+        j--
+      ) {
+        const part = message.content[j];
+
+        if (
+          part &&
+          part.type === "text" &&
+          typeof part.text === "string" &&
+          part.text.length > 0
+        ) {
+          message.content[j] = {
+            ...part,
+            prompt_cache_breakpoint: {
+              mode: "explicit"
+            }
+          };
+
+          return {
+            added: true,
+            message_index: i
+          };
+        }
+      }
+    }
+  }
+
+  return {
+    added: false,
+    message_index: null
+  };
+}
+
+// 只记录安全的诊断信息，不记录聊天正文
 function makeSafeRequestLog(body, traceId) {
+  let breakpointCount = 0;
+
+  const messages = body.messages.map(message => {
+    const content = message?.content;
+
+    if (Array.isArray(content)) {
+      for (const part of content) {
+        if (part?.prompt_cache_breakpoint) {
+          breakpointCount++;
+        }
+      }
+    }
+
+    return {
+      role: message?.role,
+      content_type:
+        typeof content === "string"
+          ? "text"
+          : Array.isArray(content)
+            ? "parts"
+            : "other"
+    };
+  });
+
   return {
     trace_id: traceId,
     endpoint: "/chat/completions",
@@ -103,19 +198,10 @@ function makeSafeRequestLog(body, traceId) {
     stream: body.stream === true,
     stream_options: body.stream_options,
     prompt_cache_options: body.prompt_cache_options,
-    prompt_cache_breakpoint_present:
-      Object.hasOwn(body, "prompt_cache_breakpoint"),
+    prompt_cache_breakpoint_count: breakpointCount,
     session_id_present:
       typeof body.session_id === "string",
-    messages: body.messages.map(message => ({
-      role: message?.role,
-      content_type:
-        typeof message?.content === "string"
-          ? "text"
-          : Array.isArray(message?.content)
-            ? "parts"
-            : "other"
-    }))
+    messages
   };
 }
 
@@ -200,7 +286,7 @@ async function forwardRequest(req, res, path, body) {
     try {
       recordUsage(JSON.parse(payload));
     } catch {
-      // 忽略不是 JSON 的事件
+      // 忽略非 JSON 事件
     }
   }
 
@@ -208,7 +294,7 @@ async function forwardRequest(req, res, path, body) {
     for await (const chunk of upstream.body) {
       if (res.destroyed) break;
 
-      // 保持原始响应内容，不影响 Cherry Studio
+      // 原样转发响应给 Cherry Studio
       res.write(chunk);
 
       if (!DIAG || !isChat || diagnosticsStopped) {
@@ -220,7 +306,6 @@ async function forwardRequest(req, res, path, body) {
       });
 
       if (isSSE) {
-        // 兼容 CRLF 和 LF 换行
         buffer = buffer.replace(/\r\n/g, "\n");
 
         let boundary;
@@ -235,7 +320,6 @@ async function forwardRequest(req, res, path, body) {
         }
 
         if (buffer.length > MAX_DIAG_BUFFER) {
-          // 避免无限积累数据
           buffer = "";
         }
       } else if (buffer.length > MAX_DIAG_BUFFER) {
@@ -282,6 +366,7 @@ const server = http.createServer(async (req, res) => {
         status: "ok",
         service: "cherry-cache-proxy",
         requested_prompt_cache_ttl: "12h",
+        cache_mode: "explicit",
         diagnostics_enabled: DIAG
       });
     }
@@ -331,16 +416,29 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // 保持同一聊天的稳定会话标识
+      // 保持会话标识稳定
       body.session_id = makeSessionId(body);
 
-      // 申请 12 小时缓存
-      // 是否真正生效仍需 OpenRouter 确认
+      // 启用 OpenAI 12 小时显式缓存
       body.prompt_cache_options = {
+        mode: "explicit",
         ttl: "12h"
       };
 
-      // 让流式响应尽可能返回 usage
+      // 添加显式缓存断点
+      const breakpoint = addExplicitCacheBreakpoint(body);
+
+      if (DIAG) {
+        console.log(
+          "CACHE_DIAG_BREAKPOINT",
+          JSON.stringify({
+            added: breakpoint.added,
+            message_index: breakpoint.message_index
+          })
+        );
+      }
+
+      // 流式响应中返回 usage
       if (body.stream === true) {
         body.stream_options = {
           ...(body.stream_options || {}),
