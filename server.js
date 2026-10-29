@@ -360,7 +360,7 @@ const server = http.createServer(async (req, res) => {
         requested_prompt_cache_ttl: "12h",
         cache_mode: "explicit",
         cache_strategy: "previous-and-current",
-        provider_only: ["openai"],
+        provider_only: ["openai", "openai/flex"],
         provider_fallbacks: false,
         diagnostics_enabled: DIAG
       });
@@ -404,11 +404,10 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // 强制只允许 OpenAI 官方供应商。
-      // 官方不可用时直接报错，不切换其他供应商。
+      // 只允许 OpenAI 官方普通端点和 OpenAI Flex。
+      // 官方端点不可用时，不回退到第三方供应商。
       body.provider = {
-        only: ["openai"],
-        order: ["openai"],
+        only: ["openai", "openai/flex"],
         allow_fallbacks: false
       };
 
@@ -429,7 +428,7 @@ const server = http.createServer(async (req, res) => {
             added: marked.length > 0,
             count: marked.length,
             message_indexes: marked,
-            provider_only: ["openai"],
+            provider_only: ["openai", "openai/flex"],
             provider_fallbacks: false
           })
         );
