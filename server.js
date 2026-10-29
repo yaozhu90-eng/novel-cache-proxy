@@ -24,8 +24,10 @@ function sendJSON(res, status, data) {
 
 function isAuthorized(req) {
   if (!PROXY_PASSWORD) return false;
+
   const a = Buffer.from(req.headers.authorization || "");
   const b = Buffer.from(`Bearer ${PROXY_PASSWORD}`);
+
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
@@ -36,28 +38,39 @@ function makeSessionId(body) {
 
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const firstUser = messages.findIndex(m => m?.role === "user");
+
   const initialMessages = firstUser >= 0
     ? messages.slice(0, firstUser + 1)
     : messages.slice(0, 1);
 
   // 保留旧算法：同一对话切换模型时 session_id 不变。
   const identity = JSON.stringify({ initialMessages });
-  const hash = crypto.createHash("sha256").update(identity).digest("hex").slice(0, 40);
+
+  const hash = crypto
+    .createHash("sha256")
+    .update(identity)
+    .digest("hex")
+    .slice(0, 40);
+
   return `cherry-${hash}`;
 }
 
 async function readJSONBody(req) {
   const chunks = [];
   let total = 0;
+
   for await (const chunk of req) {
     total += chunk.length;
+
     if (total > MAX_BODY_BYTES) {
       const error = new Error("Request body too large");
       error.status = 413;
       throw error;
     }
+
     chunks.push(chunk);
   }
+
   try {
     return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
@@ -70,8 +83,11 @@ async function readJSONBody(req) {
 function clearBreakpoints(messages) {
   for (const message of messages) {
     if (!Array.isArray(message?.content)) continue;
+
     for (const part of message.content) {
-      if (part && typeof part === "object") delete part.prompt_cache_breakpoint;
+      if (part && typeof part === "object") {
+        delete part.prompt_cache_breakpoint;
+      }
     }
   }
 }
@@ -79,20 +95,29 @@ function clearBreakpoints(messages) {
 function markMessage(messages, index) {
   const message = messages[index];
   if (!message) return false;
-  const marker = { mode: "explicit", ttl: "12h" };
 
-  if (typeof message.content === "string" && message.content.length > 0) {
+  const marker = {
+    mode: "explicit",
+    ttl: "12h"
+  };
+
+  if (
+    typeof message.content === "string" &&
+    message.content.length > 0
+  ) {
     message.content = [{
       type: "text",
       text: message.content,
       prompt_cache_breakpoint: marker
     }];
+
     return true;
   }
 
   if (Array.isArray(message.content)) {
     for (let j = message.content.length - 1; j >= 0; j--) {
       const part = message.content[j];
+
       if (
         part?.type === "text" &&
         typeof part.text === "string" &&
@@ -102,10 +127,12 @@ function markMessage(messages, index) {
           ...part,
           prompt_cache_breakpoint: marker
         };
+
         return true;
       }
     }
   }
+
   return false;
 }
 
@@ -115,10 +142,18 @@ function userMessageFingerprint(message) {
 
   const parts = typeof message.content === "string"
     ? message.content
-    : JSON.stringify(message.content ?? null, (key, value) =>
-        key === "prompt_cache_breakpoint" ? undefined : value);
+    : JSON.stringify(
+        message.content ?? null,
+        (key, value) =>
+          key === "prompt_cache_breakpoint"
+            ? undefined
+            : value
+      );
 
-  return crypto.createHash("sha256").update(parts).digest("hex");
+  return crypto
+    .createHash("sha256")
+    .update(parts)
+    .digest("hex");
 }
 
 // 不同模型及普通/Flex 分开保存。
@@ -134,22 +169,36 @@ async function dbRequest(path, options = {}) {
     throw new Error("Supabase environment variables missing");
   }
 
-  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
-    ...options,
-    headers: {
-      apikey: SUPABASE_SECRET_KEY,
-      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
-      ...(options.headers || {})
-    },
-    signal: AbortSignal.timeout(DB_TIMEOUT_MS)
-  });
+  const response = await fetch(
+    `${SUPABASE_URL}/rest/v1/${path}`,
+    {
+      ...options,
+      headers: {
+        apikey: SUPABASE_SECRET_KEY,
+        Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+        ...(options.headers || {})
+      },
+      signal: AbortSignal.timeout(DB_TIMEOUT_MS)
+    }
+  );
 
   if (!response.ok) {
     throw new Error(`Supabase HTTP ${response.status}`);
   }
 
-  if (response.status === 204) return null;
-  return response.json();
+  // 修复：Supabase 写入成功时可能返回空响应。
+  // 不再直接调用 response.json() 解析空内容。
+  if (response.status === 204) {
+    return null;
+  }
+
+  const responseText = await response.text();
+
+  if (!responseText.trim()) {
+    return null;
+  }
+
+  return JSON.parse(responseText);
 }
 
 async function loadLastBreakpoint(sessionId, key) {
@@ -161,6 +210,7 @@ async function loadLastBreakpoint(sessionId, key) {
   });
 
   const rows = await dbRequest(`${STATE_TABLE}?${query}`);
+
   return Array.isArray(rows)
     ? rows[0]?.breakpoint_data ?? null
     : null;
@@ -256,7 +306,11 @@ function configureCache(body, lastBreakpoint) {
     }
   }
 
-  return { marked, strategy, current };
+  return {
+    marked,
+    strategy,
+    current
+  };
 }
 
 function makeSafeRequestLog(body, traceId) {
@@ -519,6 +573,18 @@ const server = http.createServer(async (req, res) => {
       // 禁止模型级回退。
       delete body.models;
 
+      // 新增：检查 Cherry Studio 原始请求是否自带 session_id。
+      // 必须放在 makeSessionId() 之前。
+      // 只记录是否存在，不打印 ID 内容。
+      console.log(
+        "CHERRY_ORIGINAL_SESSION",
+        JSON.stringify({
+          has_session_id:
+            typeof body.session_id === "string" &&
+            body.session_id.length > 0
+        })
+      );
+
       // 保持稳定 session_id。
       body.session_id = makeSessionId(body);
 
@@ -546,8 +612,11 @@ const server = http.createServer(async (req, res) => {
             body.messages[currentUserIndex]
           );
 
-      const { marked, strategy, current } =
-        configureCache(body, lastBreakpoint);
+      const {
+        marked,
+        strategy,
+        current
+      } = configureCache(body, lastBreakpoint);
 
       if (DIAG) {
         console.log(
