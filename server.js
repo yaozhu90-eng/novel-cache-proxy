@@ -8,7 +8,6 @@ const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const DIAG = process.env.CACHE_DIAGNOSTICS === "true";
 
-// Render 重启后仍可从 Supabase 读取每个模型的上次断点。
 const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
 const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
 const STATE_TABLE = "cherry_cache_breakpoints";
@@ -31,11 +30,10 @@ function isAuthorized(req) {
   return a.length === b.length && crypto.timingSafeEqual(a, b);
 }
 
+// 固定使用原来的初始消息哈希生成会话 ID。
+// 不再读取客户端传入的 session_id。
+// 哈希规则保持不变，避免影响已有聊天。
 function makeSessionId(body) {
-  if (typeof body.session_id === "string" && body.session_id.length > 0) {
-    return body.session_id;
-  }
-
   const messages = Array.isArray(body.messages) ? body.messages : [];
   const firstUser = messages.findIndex(m => m?.role === "user");
 
@@ -43,7 +41,6 @@ function makeSessionId(body) {
     ? messages.slice(0, firstUser + 1)
     : messages.slice(0, 1);
 
-  // 保留旧算法：同一对话切换模型时 session_id 不变。
   const identity = JSON.stringify({ initialMessages });
 
   const hash = crypto
@@ -136,7 +133,6 @@ function markMessage(messages, index) {
   return false;
 }
 
-// 用于辨认上次是哪条用户消息，不判断缓存是否命中。
 function userMessageFingerprint(message) {
   if (message?.role !== "user") return null;
 
@@ -186,8 +182,7 @@ async function dbRequest(path, options = {}) {
     throw new Error(`Supabase HTTP ${response.status}`);
   }
 
-  // 修复：Supabase 写入成功时可能返回空响应。
-  // 不再直接调用 response.json() 解析空内容。
+  // Supabase 成功写入时可能返回空响应。
   if (response.status === 204) {
     return null;
   }
@@ -269,7 +264,7 @@ function configureCache(body, lastBreakpoint) {
     ) {
       previous = i;
     } else {
-      // 历史位置发生变化时，尝试找回同一条用户消息。
+      // 历史位置变化时，尝试找回原来的用户消息。
       for (let j = indexes.length - 2; j >= 0; j--) {
         const candidate = indexes[j];
 
@@ -288,7 +283,6 @@ function configureCache(body, lastBreakpoint) {
     }
   }
 
-  // 没找到该模型的旧断点时，使用原来的双断点策略。
   if (previous === null) {
     previous = indexes.at(-2) ?? null;
   }
@@ -358,6 +352,7 @@ function makeSafeRequestLog(body, traceId) {
   };
 }
 
+// 返回状态码和流是否完整接收。
 async function forwardRequest(req, res, path, body) {
   const traceId = crypto.randomUUID();
   const isChat = path === "/chat/completions";
@@ -390,7 +385,11 @@ async function forwardRequest(req, res, path, body) {
 
   if (!upstream.body) {
     res.end();
-    return upstream.status;
+
+    return {
+      status: upstream.status,
+      completed: true
+    };
   }
 
   const isSSE = contentType.includes("text/event-stream");
@@ -398,6 +397,7 @@ async function forwardRequest(req, res, path, body) {
   let buffer = "";
   let sawUsage = false;
   let diagnosticsStopped = false;
+  let completed = false;
 
   const decoder = new TextDecoder();
   const MAX_DIAG_BUFFER = 128 * 1024;
@@ -441,9 +441,12 @@ async function forwardRequest(req, res, path, body) {
 
   try {
     for await (const chunk of upstream.body) {
-      if (res.destroyed) break;
+      // 客户端断开时，不再视为完整请求。
+      if (res.destroyed) {
+        completed = false;
+        break;
+      }
 
-      // 保持原来的流式转发。
       res.write(chunk);
 
       if (!DIAG || !isChat || diagnosticsStopped) {
@@ -474,6 +477,9 @@ async function forwardRequest(req, res, path, body) {
       }
     }
 
+    // 只有正常读完上游响应且客户端没有断开，才算完成。
+    completed = !res.destroyed;
+
     if (DIAG && isChat) {
       if (!isSSE && !diagnosticsStopped) {
         try {
@@ -489,7 +495,8 @@ async function forwardRequest(req, res, path, body) {
           trace_id: traceId,
           upstream_status: upstream.status,
           content_type: contentType,
-          usage_found: sawUsage
+          usage_found: sawUsage,
+          stream_completed: completed
         })
       );
     }
@@ -499,7 +506,10 @@ async function forwardRequest(req, res, path, body) {
     }
   }
 
-  return upstream.status;
+  return {
+    status: upstream.status,
+    completed
+  };
 }
 
 const server = http.createServer(async (req, res) => {
@@ -564,28 +574,15 @@ const server = http.createServer(async (req, res) => {
         });
       }
 
-      // 只允许 OpenAI 官方普通端点和 OpenAI Flex。
+      // 只允许 OpenAI 官方普通端点和 Flex。
       body.provider = {
         only: ["openai", "openai/flex"],
         allow_fallbacks: false
       };
 
-      // 禁止模型级回退。
       delete body.models;
 
-      // 新增：检查 Cherry Studio 原始请求是否自带 session_id。
-      // 必须放在 makeSessionId() 之前。
-      // 只记录是否存在，不打印 ID 内容。
-      console.log(
-        "CHERRY_ORIGINAL_SESSION",
-        JSON.stringify({
-          has_session_id:
-            typeof body.session_id === "string" &&
-            body.session_id.length > 0
-        })
-      );
-
-      // 保持稳定 session_id。
+      // 固定使用原来的初始消息哈希。
       body.session_id = makeSessionId(body);
 
       const key = modelKey(body);
@@ -595,6 +592,16 @@ const server = http.createServer(async (req, res) => {
         lastBreakpoint = await loadLastBreakpoint(
           body.session_id,
           key
+        );
+
+        // 新增：数据库读取成功日志。
+        console.log(
+          "CACHE_STATE_LOAD_OK",
+          JSON.stringify({
+            found: lastBreakpoint !== null,
+            model: body.model,
+            service_tier: body.service_tier || "default"
+          })
         );
       } catch (error) {
         console.error(
@@ -639,17 +646,18 @@ const server = http.createServer(async (req, res) => {
         };
       }
 
-      // 成功转发后，保存该模型本轮的断点。
-      const status = await forwardRequest(
+      const result = await forwardRequest(
         req,
         res,
         "/chat/completions",
         body
       );
 
+      // 只有上游成功且响应完整结束，才保存本轮断点。
       if (
-        status >= 200 &&
-        status < 300 &&
+        result.status >= 200 &&
+        result.status < 300 &&
+        result.completed &&
         current !== undefined &&
         fingerprint
       ) {
@@ -661,6 +669,16 @@ const server = http.createServer(async (req, res) => {
               message_index: current,
               message_fingerprint: fingerprint
             }
+          );
+
+          // 新增：数据库保存成功日志。
+          console.log(
+            "CACHE_STATE_SAVE_OK",
+            JSON.stringify({
+              model: body.model,
+              service_tier: body.service_tier || "default",
+              message_index: current
+            })
           );
         } catch (error) {
           console.error(
