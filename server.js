@@ -1,4 +1,3 @@
-
 import http from "node:http";
 import crypto from "node:crypto";
 
@@ -8,6 +7,12 @@ const PROXY_PASSWORD = process.env.PROXY_PASSWORD;
 const OPENROUTER_BASE = "https://openrouter.ai/api/v1";
 const MAX_BODY_BYTES = 12 * 1024 * 1024;
 const DIAG = process.env.CACHE_DIAGNOSTICS === "true";
+
+// Render 重启后仍可从 Supabase 读取每个模型的上次断点。
+const SUPABASE_URL = (process.env.SUPABASE_URL || "").replace(/\/+$/, "");
+const SUPABASE_SECRET_KEY = process.env.SUPABASE_SECRET_KEY;
+const STATE_TABLE = "cherry_cache_breakpoints";
+const DB_TIMEOUT_MS = 4000;
 
 function sendJSON(res, status, data) {
   res.writeHead(status, {
@@ -35,42 +40,26 @@ function makeSessionId(body) {
     ? messages.slice(0, firstUser + 1)
     : messages.slice(0, 1);
 
-  // 不将模型 ID 纳入哈希。
-  // 同一对话切换普通 OpenAI / Flex 时，
-  // 只要初始消息相同，就生成相同的 session_id。
-  const identity = JSON.stringify({
-    initialMessages
-  });
-
-  const hash = crypto
-    .createHash("sha256")
-    .update(identity)
-    .digest("hex")
-    .slice(0, 40);
-
+  // 保留旧算法：同一对话切换模型时 session_id 不变。
+  const identity = JSON.stringify({ initialMessages });
+  const hash = crypto.createHash("sha256").update(identity).digest("hex").slice(0, 40);
   return `cherry-${hash}`;
 }
 
 async function readJSONBody(req) {
   const chunks = [];
   let total = 0;
-
   for await (const chunk of req) {
     total += chunk.length;
-
     if (total > MAX_BODY_BYTES) {
       const error = new Error("Request body too large");
       error.status = 413;
       throw error;
     }
-
     chunks.push(chunk);
   }
-
   try {
-    return JSON.parse(
-      Buffer.concat(chunks).toString("utf8")
-    );
+    return JSON.parse(Buffer.concat(chunks).toString("utf8"));
   } catch {
     const error = new Error("Invalid JSON body");
     error.status = 400;
@@ -81,11 +70,8 @@ async function readJSONBody(req) {
 function clearBreakpoints(messages) {
   for (const message of messages) {
     if (!Array.isArray(message?.content)) continue;
-
     for (const part of message.content) {
-      if (part && typeof part === "object") {
-        delete part.prompt_cache_breakpoint;
-      }
+      if (part && typeof part === "object") delete part.prompt_cache_breakpoint;
     }
   }
 }
@@ -93,29 +79,20 @@ function clearBreakpoints(messages) {
 function markMessage(messages, index) {
   const message = messages[index];
   if (!message) return false;
+  const marker = { mode: "explicit", ttl: "12h" };
 
-  const marker = {
-    mode: "explicit",
-    ttl: "12h"
-  };
-
-  if (
-    typeof message.content === "string" &&
-    message.content.length > 0
-  ) {
+  if (typeof message.content === "string" && message.content.length > 0) {
     message.content = [{
       type: "text",
       text: message.content,
       prompt_cache_breakpoint: marker
     }];
-
     return true;
   }
 
   if (Array.isArray(message.content)) {
     for (let j = message.content.length - 1; j >= 0; j--) {
       const part = message.content[j];
-
       if (
         part?.type === "text" &&
         typeof part.text === "string" &&
@@ -129,11 +106,86 @@ function markMessage(messages, index) {
       }
     }
   }
-
   return false;
 }
 
-function configureCache(body) {
+// 用于辨认上次是哪条用户消息，不判断缓存是否命中。
+function userMessageFingerprint(message) {
+  if (message?.role !== "user") return null;
+
+  const parts = typeof message.content === "string"
+    ? message.content
+    : JSON.stringify(message.content ?? null, (key, value) =>
+        key === "prompt_cache_breakpoint" ? undefined : value);
+
+  return crypto.createHash("sha256").update(parts).digest("hex");
+}
+
+// 不同模型及普通/Flex 分开保存。
+function modelKey(body) {
+  return JSON.stringify([
+    body.model || "",
+    body.service_tier || "default"
+  ]);
+}
+
+async function dbRequest(path, options = {}) {
+  if (!SUPABASE_URL || !SUPABASE_SECRET_KEY) {
+    throw new Error("Supabase environment variables missing");
+  }
+
+  const response = await fetch(`${SUPABASE_URL}/rest/v1/${path}`, {
+    ...options,
+    headers: {
+      apikey: SUPABASE_SECRET_KEY,
+      Authorization: `Bearer ${SUPABASE_SECRET_KEY}`,
+      ...(options.headers || {})
+    },
+    signal: AbortSignal.timeout(DB_TIMEOUT_MS)
+  });
+
+  if (!response.ok) {
+    throw new Error(`Supabase HTTP ${response.status}`);
+  }
+
+  if (response.status === 204) return null;
+  return response.json();
+}
+
+async function loadLastBreakpoint(sessionId, key) {
+  const query = new URLSearchParams({
+    select: "breakpoint_data",
+    session_id: `eq.${sessionId}`,
+    model_key: `eq.${key}`,
+    limit: "1"
+  });
+
+  const rows = await dbRequest(`${STATE_TABLE}?${query}`);
+  return Array.isArray(rows)
+    ? rows[0]?.breakpoint_data ?? null
+    : null;
+}
+
+async function saveLastBreakpoint(sessionId, key, data) {
+  await dbRequest(
+    `${STATE_TABLE}?on_conflict=session_id,model_key`,
+    {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Prefer: "resolution=merge-duplicates,return=minimal"
+      },
+      body: JSON.stringify({
+        session_id: sessionId,
+        model_key: key,
+        breakpoint_data: data,
+        updated_at: new Date().toISOString()
+      })
+    }
+  );
+}
+
+function configureCache(body, lastBreakpoint) {
   clearBreakpoints(body.messages);
 
   body.prompt_cache_options = {
@@ -149,16 +201,62 @@ function configureCache(body) {
     }
   }
 
+  const current = indexes.at(-1);
+  let previous = null;
+  let strategy = "previous-and-current";
+
+  if (
+    lastBreakpoint &&
+    Number.isInteger(lastBreakpoint.message_index)
+  ) {
+    const i = lastBreakpoint.message_index;
+
+    if (
+      i < current &&
+      body.messages[i]?.role === "user" &&
+      userMessageFingerprint(body.messages[i]) ===
+        lastBreakpoint.message_fingerprint
+    ) {
+      previous = i;
+    } else {
+      // 历史位置发生变化时，尝试找回同一条用户消息。
+      for (let j = indexes.length - 2; j >= 0; j--) {
+        const candidate = indexes[j];
+
+        if (
+          userMessageFingerprint(body.messages[candidate]) ===
+          lastBreakpoint.message_fingerprint
+        ) {
+          previous = candidate;
+          break;
+        }
+      }
+    }
+
+    if (previous !== null) {
+      strategy = "model-last-and-current";
+    }
+  }
+
+  // 没找到该模型的旧断点时，使用原来的双断点策略。
+  if (previous === null) {
+    previous = indexes.at(-2) ?? null;
+  }
+
   const marked = [];
 
-  // 保留上一轮断点，同时标记当前轮断点。
-  for (const index of indexes.slice(-2)) {
-    if (markMessage(body.messages, index)) {
+  for (const index of [previous, current]) {
+    if (
+      index !== null &&
+      index !== undefined &&
+      !marked.includes(index) &&
+      markMessage(body.messages, index)
+    ) {
       marked.push(index);
     }
   }
 
-  return marked;
+  return { marked, strategy, current };
 }
 
 function makeSafeRequestLog(body, traceId) {
@@ -238,7 +336,7 @@ async function forwardRequest(req, res, path, body) {
 
   if (!upstream.body) {
     res.end();
-    return;
+    return upstream.status;
   }
 
   const isSSE = contentType.includes("text/event-stream");
@@ -291,7 +389,7 @@ async function forwardRequest(req, res, path, body) {
     for await (const chunk of upstream.body) {
       if (res.destroyed) break;
 
-      // 将上游响应原样转发给 Cherry Studio。
+      // 保持原来的流式转发。
       res.write(chunk);
 
       if (!DIAG || !isChat || diagnosticsStopped) {
@@ -346,6 +444,8 @@ async function forwardRequest(req, res, path, body) {
       res.end();
     }
   }
+
+  return upstream.status;
 }
 
 const server = http.createServer(async (req, res) => {
@@ -361,7 +461,11 @@ const server = http.createServer(async (req, res) => {
         service: "cherry-cache-proxy",
         requested_prompt_cache_ttl: "12h",
         cache_mode: "explicit",
-        cache_strategy: "previous-and-current",
+        cache_strategy: "model-last-and-current",
+        state_backend:
+          SUPABASE_URL && SUPABASE_SECRET_KEY
+            ? "supabase"
+            : "unconfigured",
         provider_only: ["openai", "openai/flex"],
         provider_fallbacks: false,
         diagnostics_enabled: DIAG
@@ -407,7 +511,6 @@ const server = http.createServer(async (req, res) => {
       }
 
       // 只允许 OpenAI 官方普通端点和 OpenAI Flex。
-      // 官方端点不可用时，不回退到第三方供应商。
       body.provider = {
         only: ["openai", "openai/flex"],
         allow_fallbacks: false
@@ -416,17 +519,41 @@ const server = http.createServer(async (req, res) => {
       // 禁止模型级回退。
       delete body.models;
 
-      // 保持同一对话的稳定 session_id。
+      // 保持稳定 session_id。
       body.session_id = makeSessionId(body);
 
-      // 保留上一轮 + 当前轮的显式缓存断点。
-      const marked = configureCache(body);
+      const key = modelKey(body);
+      let lastBreakpoint = null;
+
+      try {
+        lastBreakpoint = await loadLastBreakpoint(
+          body.session_id,
+          key
+        );
+      } catch (error) {
+        console.error(
+          "CACHE_STATE_LOAD_ERROR",
+          error?.message || "unknown"
+        );
+      }
+
+      const currentUserIndex =
+        body.messages.findLastIndex(m => m?.role === "user");
+
+      const fingerprint = currentUserIndex < 0
+        ? null
+        : userMessageFingerprint(
+            body.messages[currentUserIndex]
+          );
+
+      const { marked, strategy, current } =
+        configureCache(body, lastBreakpoint);
 
       if (DIAG) {
         console.log(
           "CACHE_DIAG_BREAKPOINT",
           JSON.stringify({
-            strategy: "previous-and-current",
+            strategy,
             added: marked.length > 0,
             count: marked.length,
             message_indexes: marked,
@@ -443,12 +570,38 @@ const server = http.createServer(async (req, res) => {
         };
       }
 
-      return await forwardRequest(
+      // 成功转发后，保存该模型本轮的断点。
+      const status = await forwardRequest(
         req,
         res,
         "/chat/completions",
         body
       );
+
+      if (
+        status >= 200 &&
+        status < 300 &&
+        current !== undefined &&
+        fingerprint
+      ) {
+        try {
+          await saveLastBreakpoint(
+            body.session_id,
+            key,
+            {
+              message_index: current,
+              message_fingerprint: fingerprint
+            }
+          );
+        } catch (error) {
+          console.error(
+            "CACHE_STATE_SAVE_ERROR",
+            error?.message || "unknown"
+          );
+        }
+      }
+
+      return;
     }
 
     return sendJSON(res, 404, {
