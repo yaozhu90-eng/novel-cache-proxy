@@ -388,7 +388,9 @@ const server = http.createServer(async (req, res) => {
         requested_prompt_cache_ttl: "12h", cache_mode: "explicit",
         cache_strategy: "model-last-and-current",
         state_backend: SUPABASE_URL && SUPABASE_SECRET_KEY ? "supabase" : "unconfigured",
-        provider_only: ["openai", "openai/flex"],
+        provider_routes: {
+          standard: ["openai"], floor: ["openai/flex"]
+        },
         provider_fallbacks: false, diagnostics_enabled: DIAG,
         cache_prefix_normalization: "user-text-v1"
       });
@@ -412,10 +414,26 @@ const server = http.createServer(async (req, res) => {
     if (!Array.isArray(body.messages)) {
       return sendJSON(res, 400, { error: "messages must be an array" });
     }
+
+    // 根据客户端传入的模型 ID 固定路由。
+    // 普通模型只用 Default；:floor 模型只用 Flex。
+    const isFloor = typeof body.model === "string" &&
+      body.model.endsWith(":floor");
+
+    body.service_tier = isFloor ? "flex" : "default";
+
     body.provider = {
-      only: ["openai", "openai/flex"], allow_fallbacks: false
+      only: isFloor ? ["openai/flex"] : ["openai"],
+      allow_fallbacks: false
     };
+
     delete body.models;
+
+    console.log("CACHE_ROUTE_PIN", JSON.stringify({
+      model: body.model,
+      service_tier: body.service_tier,
+      provider_only: body.provider.only
+    }));
 
     // 保持旧会话 ID 和 Supabase 用户消息指纹规则不变。
     body.session_id = makeSessionId(body);
@@ -449,7 +467,7 @@ const server = http.createServer(async (req, res) => {
       console.log("CACHE_DIAG_BREAKPOINT", JSON.stringify({
         strategy, added: marked.length > 0, count: marked.length,
         message_indexes: marked,
-        provider_only: ["openai", "openai/flex"], provider_fallbacks: false
+        provider_only: body.provider.only, provider_fallbacks: false
       }));
       console.log("CACHE_PREFIX_COMPARE", JSON.stringify({
         session_id: body.session_id, model: body.model,
