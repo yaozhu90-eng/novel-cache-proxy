@@ -30,7 +30,7 @@ async function readBody(req) {
   const chunks = []; let size = 0;
   for await (const chunk of req) {
     size += chunk.length;
-    if (size > 12 * 1024 * 1024) throw error('Request body too large', 413);
+    if (size > 64 * 1024 * 1024) throw error('Request body too large', 413);
     chunks.push(chunk);
   }
   try { return JSON.parse(Buffer.concat(chunks).toString('utf8')); }
