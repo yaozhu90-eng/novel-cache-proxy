@@ -266,6 +266,50 @@ http.createServer(async (req, res) => {
       throw error('messages must be an array', 400);
     if (typeof body.model !== 'string' || !body.model) throw error('model is required', 400);
     const trace = crypto.randomUUID(), started = Date.now();
+    // 临时诊断：记录客户端标识，不修改请求，不打印聊天正文。
+{
+  const pickIdentifiers = obj => {
+    if (!obj || typeof obj !== 'object' || Array.isArray(obj)) {
+      return {};
+    }
+
+    const result = {};
+
+    for (const [key, value] of Object.entries(obj)) {
+      const looksLikeIdentifier =
+        /(^|_)(id|uuid)$/i.test(key) ||
+        /^(session|conversation|chat|thread|branch|parent|request|message)(Id|ID|Uuid)$/i.test(key);
+
+      if (!looksLikeIdentifier) continue;
+
+      if (
+        value === null ||
+        typeof value === 'string' ||
+        typeof value === 'number' ||
+        typeof value === 'boolean'
+      ) {
+        result[key] = value;
+      }
+    }
+
+    return result;
+  };
+
+  log('CLIENT_BRANCH_DIAG', {
+    trace_id: trace,
+    model: body.model,
+    body_keys: Object.keys(body),
+    client_ids: pickIdentifiers(body),
+    metadata_keys:
+      body.metadata &&
+      typeof body.metadata === 'object' &&
+      !Array.isArray(body.metadata)
+        ? Object.keys(body.metadata)
+        : [],
+    metadata_ids: pickIdentifiers(body.metadata),
+    client_session_header: req.headers['x-session-id'] ?? null
+  });
+}
     const floor = body.model.endsWith(':floor');
     body.service_tier = floor ? 'flex' : 'default';
     body.provider = { only: floor ? ['openai/flex'] : ['openai'], allow_fallbacks: false };
