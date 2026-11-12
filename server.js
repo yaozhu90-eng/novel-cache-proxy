@@ -298,6 +298,11 @@ http.createServer(async (req, res) => {
   log('CLIENT_BRANCH_DIAG', {
     trace_id: trace,
     model: body.model,
+    reasoning: body.reasoning ?? null,
+reasoning_effort: body.reasoning_effort ?? null,
+include_reasoning: body.include_reasoning ?? null,
+max_tokens: body.max_tokens ?? null,
+max_completion_tokens: body.max_completion_tokens ?? null,
     body_keys: Object.keys(body),
     client_ids: pickIdentifiers(body),
     metadata_keys:
