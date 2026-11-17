@@ -31,7 +31,7 @@ const ORIGIN = (
 ).replace(/\/+$/, '');
 
 const TABLE = 'cherry_cache_breakpoints';
-const VERSION = 'route-isolated-v6-claude-1h';
+const VERSION = 'route-isolated-v5-branches';
 
 const DIAG = E.CACHE_DIAGNOSTICS === 'true';
 
@@ -67,12 +67,7 @@ const CHECKPOINT_HISTORY_HOURS = envNumber(
   720
 );
 
-// GPT: preserve the original 12-hour eligibility estimate.
-const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
-
-// Claude: independent 1-hour eligibility estimate.
-const CLAUDE_CACHE_TTL_MS = 60 * 60 * 1000;
-const CLAUDE_CACHE_POLICY = 'anthropic-explicit-1h-v1';
+const CACHE_TTL_MS = 30 * 60 * 1000;
 
 const HISTORY_MS =
   CHECKPOINT_HISTORY_HOURS * 60 * 60 * 1000;
@@ -89,7 +84,6 @@ const queues = new Map();
 const hash = value =>
   crypto.createHash('sha256').update(value).digest('hex');
 
-// Preserve GPT's original serialization behavior.
 const omitMarker = (key, value) =>
   key === 'prompt_cache_breakpoint' ? undefined : value;
 
@@ -151,11 +145,6 @@ function fingerprint(message) {
   );
 }
 
-function isClaudeModel(model) {
-  return typeof model === 'string' &&
-    model.startsWith('anthropic/claude-');
-}
-
 /* =========================
  * Request body
  * ========================= */
@@ -179,7 +168,8 @@ function readBody(req) {
       settled = true;
       cleanup();
 
-      // Drain without destroying the socket before sending a 413.
+      // Drain the remaining request without retaining it.
+      // Do not destroy the socket before sending a 413.
       req.on('error', () => {});
       req.resume();
 
@@ -264,6 +254,7 @@ function readBody(req) {
  * ========================= */
 
 function makeSessionId(messages) {
+  // Preserve the original session-ID algorithm.
   const i = messages.findIndex(m => m?.role === 'user');
 
   const initialMessages =
@@ -294,7 +285,6 @@ function normalize(messages) {
   return count;
 }
 
-// GPT: unchanged.
 function removeMarkers(messages) {
   for (const message of messages) {
     if (!Array.isArray(message?.content)) continue;
@@ -325,7 +315,6 @@ function lastTextPart(message) {
   return -1;
 }
 
-// GPT: unchanged.
 function mark(messages, index) {
   if (!Number.isInteger(index)) return false;
 
@@ -338,113 +327,7 @@ function mark(messages, index) {
     ...message.content[partIndex],
     prompt_cache_breakpoint: {
       mode: 'explicit',
-      ttl: '12h'
-    }
-  };
-
-  return true;
-}
-
-/* =========================
- * Claude-only preparation
- * ========================= */
-
-function clearClaudeCacheControls(body) {
-  // Claude must not inherit OpenAI cache settings or an
-  // additional automatic/default-5m cache configuration.
-  delete body.cache_control;
-  delete body.prompt_cache_breakpoint;
-  delete body.prompt_cache_options;
-  delete body.prompt_cache_key;
-  delete body.prompt_cache_retention;
-
-  for (const message of body.messages) {
-    delete message.cache_control;
-    delete message.prompt_cache_breakpoint;
-
-    if (!Array.isArray(message.content)) continue;
-
-    for (const part of message.content) {
-      if (!part || typeof part !== 'object') continue;
-
-      delete part.cache_control;
-      delete part.prompt_cache_breakpoint;
-    }
-  }
-
-  if (Array.isArray(body.tools)) {
-    for (const tool of body.tools) {
-      if (!tool || typeof tool !== 'object') continue;
-
-      delete tool.cache_control;
-      delete tool.prompt_cache_breakpoint;
-
-      if (
-        tool.function &&
-        typeof tool.function === 'object'
-      ) {
-        delete tool.function.cache_control;
-        delete tool.function.prompt_cache_breakpoint;
-      }
-    }
-  }
-
-  // Deliberately do not recurse into tool JSON schemas,
-  // tool arguments, reasoning details, or user data.
-}
-
-function prepareClaude(body) {
-  if (body.model.includes(':')) {
-    throw fail(
-      'Claude requires a base model ID without variant suffixes; do not use :floor, :nitro or :batch',
-      400
-    );
-  }
-
-  clearClaudeCacheControls(body);
-
-  // Do not send OpenAI's default/flex service-tier values
-  // to Claude.
-  delete body.service_tier;
-
-  body.provider = {
-    only: ['anthropic'],
-    allow_fallbacks: false
-  };
-
-  delete body.models;
-
-  // Claude has no old session IDs to preserve.
-  // Normalize before computing its session for stability.
-  const normalized = normalize(body.messages);
-  const baseSession = makeSessionId(body.messages);
-
-  body.session_id = `${baseSession}-claude`;
-
-  // Independent namespace, exact model ID and cache policy.
-  const key = JSON.stringify([
-    body.model,
-    'anthropic',
-    'standard',
-    CLAUDE_CACHE_POLICY
-  ]);
-
-  return { key, normalized };
-}
-
-function markClaude(messages, index) {
-  if (!Number.isInteger(index)) return false;
-
-  const message = messages[index];
-  const partIndex = lastTextPart(message);
-
-  if (partIndex < 0) return false;
-
-  message.content[partIndex] = {
-    ...message.content[partIndex],
-    cache_control: {
-      type: 'ephemeral',
-      ttl: '1h'
+      ttl: '30m'
     }
   };
 
@@ -459,6 +342,8 @@ function buildPrefixIndex(messages) {
   const points = new Map();
   const messageHashes = [];
 
+  // Incremental hash of the same JSON array representation
+  // used by the original snapshot function.
   const running = crypto.createHash('sha256');
   running.update('[');
 
@@ -585,6 +470,7 @@ function clientDiagnostics(req, body, trace) {
           ['string', 'number', 'boolean'].includes(typeof value)
         )
       ) {
+        // Hash identifiers rather than logging their raw values.
         result[key] =
           value === null ? null : hash(String(value));
       }
@@ -690,6 +576,7 @@ function unpackCheckpoints(row) {
     typeof cp.prefix_sha256 === 'string'
   );
 
+  // Compatibility with the original single-checkpoint data.
   if (
     Number.isInteger(data.message_index) &&
     typeof data.prefix_sha256 === 'string'
@@ -734,10 +621,7 @@ function mergeCheckpoints(oldRow, incoming) {
 
     const existing = byIdentity.get(identity);
 
-    if (
-      !existing ||
-      checkpointTime(cp) > checkpointTime(existing)
-    ) {
+    if (!existing || checkpointTime(cp) > checkpointTime(existing)) {
       byIdentity.set(identity, cp);
     }
   }
@@ -755,6 +639,7 @@ async function saveCAS(session, key, incoming) {
     if (!checkpoints.length) return 'no_checkpoint';
 
     const latest = checkpoints[0];
+
     const oldMs = Date.parse(old?.updated_at || '');
 
     const updated = new Date(Math.max(
@@ -762,6 +647,8 @@ async function saveCAS(session, key, incoming) {
       Number.isFinite(oldMs) ? oldMs + 1 : 0
     )).toISOString();
 
+    // Keep legacy fields at the top level.
+    // New code uses the full checkpoints array.
     const payload = {
       session_id: session,
       model_key: key,
@@ -809,7 +696,8 @@ async function saveCAS(session, key, incoming) {
       return 'saved';
     }
 
-    // Concurrent change: reload and merge.
+    // A concurrent request changed the row.
+    // Reload and merge instead of discarding a branch.
   }
 
   throw fail('Supabase concurrent update retries exceeded', 503);
@@ -835,8 +723,7 @@ async function guardedSave(session, key, incoming) {
 }
 
 /* =========================
- * GPT checkpoint selection
- * Original behavior preserved
+ * Checkpoint selection
  * ========================= */
 
 function chooseCheckpoints(body, row, indexData, config) {
@@ -855,18 +742,21 @@ function chooseCheckpoints(body, row, indexData, config) {
     if (cp.message_index >= current) return false;
 
     const point = indexData.points.get(cp.message_index);
-
     if (!point || point.prefix_sha256 !== cp.prefix_sha256) {
       return false;
     }
 
     const time = checkpointTime(cp);
 
+    // This is a local eligibility estimate, not a promise
+    // that the upstream cache still exists.
     return time > 0 &&
       now - time >= 0 &&
       now - time < CACHE_TTL_MS;
   });
 
+  // Prefer the longest matching prefix.
+  // For equal positions, prefer the same request configuration.
   matches.sort((a, b) =>
     b.message_index - a.message_index ||
     Number(b.request_context_sha256 === config.sha256) -
@@ -904,85 +794,9 @@ function chooseCheckpoints(body, row, indexData, config) {
 }
 
 /* =========================
- * Claude checkpoint selection
- * Independent 1-hour policy
- * ========================= */
-
-function chooseClaudeCheckpoints(body, row, indexData, config) {
-  const users = [];
-
-  for (let i = 0; i < body.messages.length; i++) {
-    if (body.messages[i].role === 'user') users.push(i);
-  }
-
-  const current = users.at(-1);
-  const now = Date.now();
-  const saved = unpackCheckpoints(row);
-
-  const matches = saved.filter(cp => {
-    if (!Number.isInteger(current)) return false;
-
-    // Claude also permits an exact repeated request.
-    if (cp.message_index > current) return false;
-
-    const point = indexData.points.get(cp.message_index);
-
-    if (!point || point.prefix_sha256 !== cp.prefix_sha256) {
-      return false;
-    }
-
-    const time = checkpointTime(cp);
-
-    // Local estimate only; upstream usage confirms actual hits.
-    return time > 0 &&
-      now - time >= 0 &&
-      now - time < CLAUDE_CACHE_TTL_MS;
-  });
-
-  matches.sort((a, b) =>
-    b.message_index - a.message_index ||
-    Number(b.request_context_sha256 === config.sha256) -
-      Number(a.request_context_sha256 === config.sha256) ||
-    checkpointTime(b) - checkpointTime(a)
-  );
-
-  const selected = matches[0] || null;
-
-  const previous = selected
-    ? selected.message_index
-    : users.at(-2) ?? null;
-
-  const marked = [];
-
-  // At most two explicit breakpoints.
-  // Re-marking the old matching boundary avoids relying only
-  // on Claude's automatic lookback window.
-  for (const i of [previous, current]) {
-    if (
-      Number.isInteger(i) &&
-      !marked.includes(i) &&
-      markClaude(body.messages, i)
-    ) {
-      marked.push(i);
-    }
-  }
-
-  return {
-    previous,
-    current,
-    marked,
-    selected,
-    fromState: Boolean(selected),
-    stored_count: saved.length,
-    matching_count: matches.length
-  };
-}
-
-/* =========================
  * Usage handling
  * ========================= */
 
-// GPT: unchanged.
 function counts(usage) {
   const details =
     usage?.prompt_tokens_details ||
@@ -996,23 +810,6 @@ function counts(usage) {
   const written =
     details.cache_write_tokens ??
     usage?.cache_write_tokens;
-
-  return {
-    cached: Number.isFinite(cached) ? cached : null,
-    written: Number.isFinite(written) ? written : null
-  };
-}
-
-// OpenRouter normally returns normalized fields.
-// Claude-only fallback also accepts native usage names.
-function claudeCounts(usage) {
-  const normalized = counts(usage);
-
-  const cached = normalized.cached ??
-    usage?.cache_read_input_tokens;
-
-  const written = normalized.written ??
-    usage?.cache_creation_input_tokens;
 
   return {
     cached: Number.isFinite(cached) ? cached : null,
@@ -1060,151 +857,6 @@ function usageSummary(usage) {
     cost: usage?.cost ?? null,
     cost_details: usage?.cost_details ?? null
   };
-}
-
-/* =========================
- * Claude-only metadata save
- * ========================= */
-
-async function saveClaudeCheckpoint({
-  body,
-  key,
-  selection,
-  after,
-  config,
-  result,
-  started,
-  trace
-}) {
-  const { current, marked } = selection;
-  const { cached, written } = claudeCounts(result.usage);
-
-  const good =
-    result.status >= 200 &&
-    result.status < 300 &&
-    result.complete;
-
-  const currentMessage = body.messages[current];
-
-  const boundaryAtPromptEnd =
-    Boolean(after) &&
-    current === body.messages.length - 1 &&
-    Array.isArray(currentMessage?.content) &&
-    after.part_index === currentMessage.content.length - 1;
-
-  // Native Anthropic input_tokens excludes cached tokens.
-  // Only use OpenRouter's normalized prompt_tokens here.
-  const promptTokens = result.usage?.prompt_tokens;
-
-  const fullPromptRead =
-    written === 0 &&
-    Number.isFinite(promptTokens) &&
-    promptTokens > 0 &&
-    cached === promptTokens &&
-    boundaryAtPromptEnd;
-
-  let skipReason = null;
-  let confidence = null;
-
-  if (!good) {
-    skipReason = 'unsuccessful_or_incomplete';
-  } else if (!result.usage) {
-    skipReason = 'usage_missing';
-  } else if (!after || !marked.includes(current)) {
-    skipReason = 'uncacheable_current';
-  } else if (written > 0) {
-    confidence = 'write_observed_position_inferred';
-  } else if (fullPromptRead) {
-    // A confirmed full-prompt read can refresh this local
-    // boundary estimate without inventing a cache write.
-    confidence = 'full_prompt_read_observed_position_inferred';
-  } else if (written === null) {
-    skipReason = 'write_usage_missing';
-  } else {
-    // A partial cache read alone does not identify the exact
-    // boundary that was read/refreshed.
-    skipReason = 'no_write_or_unconfirmed_boundary';
-  }
-
-  log('CLAUDE_CACHE_RESULT', {
-    trace_id: trace,
-    generation_id: result.generationId,
-    model: body.model,
-    provider_only: body.provider.only,
-    requested_ttl: '1h',
-    stream_completed: result.complete,
-    cached_tokens: cached,
-    cache_write_tokens: written,
-    cache_hit: cached !== null ? cached > 0 : null,
-    full_prompt_read: fullPromptRead
-  });
-
-  if (skipReason) {
-    log('CACHE_STATE_SAVE_SKIPPED', {
-      trace_id: trace,
-      generation_id: result.generationId,
-      family: 'claude',
-      reason: skipReason,
-      cached_tokens: cached,
-      cache_write_tokens: written,
-      requested_current_index: current ?? null
-    });
-
-    return;
-  }
-
-  const observedAt = new Date().toISOString();
-
-  const checkpoint = {
-    message_index: current,
-    part_index: after.part_index,
-    message_fingerprint: after.message_fingerprint,
-    prefix_sha256: after.prefix_sha256,
-    request_context_sha256: config.sha256,
-    request_config_field_hashes: config.field_hashes,
-    request_started_ms: started,
-    last_write_observed_at:
-      written > 0 ? observedAt : null,
-    last_cache_observed_at: observedAt,
-    checkpoint_confidence: confidence,
-    cache_policy: CLAUDE_CACHE_POLICY,
-    requested_cache_ttl: '1h',
-    cache_write_tokens: written,
-    cache_read_tokens: cached,
-    generation_id: result.generationId
-  };
-
-  try {
-    const saved = await guardedSave(
-      body.session_id,
-      key,
-      checkpoint
-    );
-
-    log(
-      saved === 'saved'
-        ? 'CACHE_STATE_SAVE_OK'
-        : 'CACHE_STATE_SAVE_SKIPPED',
-      {
-        trace_id: trace,
-        reason: saved,
-        family: 'claude',
-        model: body.model,
-        provider_only: body.provider.only,
-        requested_cache_ttl: '1h',
-        message_index: current,
-        cache_write_tokens: written,
-        cache_read_tokens: cached,
-        checkpoint_confidence: confidence
-      }
-    );
-  } catch (error) {
-    log('CACHE_STATE_SAVE_ERROR', {
-      trace_id: trace,
-      family: 'claude',
-      error: error.message
-    });
-  }
 }
 
 /* =========================
@@ -1315,11 +967,8 @@ async function forward(req, res, path, body, trace) {
     if (typeof obj.service_tier === 'string') {
       actualTier = obj.service_tier;
 
-      // GPT always sets service_tier, so its check is unchanged.
-      // Claude does not send OpenAI service-tier values.
       if (
         body &&
-        typeof body.service_tier === 'string' &&
         actualTier !== body.service_tier
       ) {
         tierMismatch = true;
@@ -1522,8 +1171,7 @@ async function forward(req, res, path, body, trace) {
       }
     }
 
-    transportEnded =
-      !disconnected && !controller.signal.aborted;
+    transportEnded = !disconnected && !controller.signal.aborted;
 
     if (body && transportEnded) {
       const tail = decoder.decode();
@@ -1576,6 +1224,7 @@ async function forward(req, res, path, body, trace) {
         }
       );
     } else if (!res.destroyed && !res.writableEnded) {
+      // Do not make an interrupted stream look normally finished.
       res.destroy();
     }
 
@@ -1592,10 +1241,6 @@ async function forward(req, res, path, body, trace) {
       const final = result();
 
       if (DIAG || !final.complete || tierMismatch) {
-        const cacheCounts = isClaudeModel(body.model)
-          ? claudeCounts(usage)
-          : counts(usage);
-
         log('CACHE_DIAG_RESULT', {
           trace_id: trace,
           generation_id: generationId,
@@ -1614,7 +1259,7 @@ async function forward(req, res, path, body, trace) {
           usage_events: usageEvents,
           actual_service_tier: actualTier,
           route_mismatch: tierMismatch,
-          ...cacheCounts
+          ...counts(usage)
         });
       }
     }
@@ -1638,18 +1283,9 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         status: 'ok',
         version: VERSION,
-
-        // Preserve existing GPT health fields.
-        requested_prompt_cache_ttl: '12h',
+        requested_prompt_cache_ttl: '30m',
         cache_mode: 'explicit',
         cache_strategy: 'matching-prefix-and-current',
-
-        requested_prompt_cache_ttl_by_family: {
-          gpt: '12h',
-          claude: '1h'
-        },
-
-        claude_cache_policy: CLAUDE_CACHE_POLICY,
         checkpoint_storage: 'multi-checkpoint-json-v2',
         max_body_mb: MAX_BODY_MB,
         max_checkpoints_per_group: MAX_CHECKPOINTS,
@@ -1659,8 +1295,7 @@ const server = http.createServer(async (req, res) => {
           : 'unconfigured',
         provider_routes: {
           standard: ['openai'],
-          floor: ['openai/flex'],
-          claude: ['anthropic']
+          floor: ['openai/flex']
         },
         provider_fallbacks: false,
         pro_merged: false,
@@ -1737,52 +1372,42 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    // Observe client parameters before overriding route/session.
     clientDiagnostics(req, body, trace);
 
-    const claude = isClaudeModel(body.model);
+    const floor = body.model.endsWith(':floor');
 
-    let key;
-    let normalized;
+    // Preserve the original strict routing behavior.
+    body.service_tier = floor ? 'flex' : 'default';
 
-    if (claude) {
-      // New Claude-only path.
-      ({ key, normalized } = prepareClaude(body));
-    } else {
-      // Original GPT path: routing, session IDs, model keys,
-      // normalization and cache controls are preserved.
-      const floor = body.model.endsWith(':floor');
+    body.provider = {
+      only: floor ? ['openai/flex'] : ['openai'],
+      allow_fallbacks: false
+    };
 
-      body.service_tier = floor ? 'flex' : 'default';
+    delete body.models;
 
-      body.provider = {
-        only: floor ? ['openai/flex'] : ['openai'],
-        allow_fallbacks: false
-      };
+    // Compute before normalization, preserving original IDs.
+    const baseSession = makeSessionId(body.messages);
 
-      delete body.models;
+    body.session_id = floor
+      ? `${baseSession}-flex`
+      : baseSession;
 
-      // GPT must continue computing the session before
-      // normalization to preserve existing stored records.
-      const baseSession = makeSessionId(body.messages);
+    // Pro/non-Pro and standard/Flex remain separate.
+    const key = JSON.stringify([
+      body.model,
+      body.service_tier
+    ]);
 
-      body.session_id = floor
-        ? `${baseSession}-flex`
-        : baseSession;
+    const normalized = normalize(body.messages);
 
-      key = JSON.stringify([
-        body.model,
-        body.service_tier
-      ]);
+    removeMarkers(body.messages);
 
-      normalized = normalize(body.messages);
-
-      removeMarkers(body.messages);
-
-      body.prompt_cache_options = {
-        mode: 'explicit',
-        ttl: '12h'
-      };
-    }
+    body.prompt_cache_options = {
+      mode: 'explicit',
+      ttl: '30m'
+    };
 
     if (body.stream === true) {
       body.stream_options = {
@@ -1791,8 +1416,6 @@ const server = http.createServer(async (req, res) => {
       };
     }
 
-    // For Claude, all incoming cache markers have already
-    // been removed. New markers are added after hashing.
     const config = requestConfig(body);
     const indexData = buildPrefixIndex(body.messages);
 
@@ -1823,9 +1446,12 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    const selection = claude
-      ? chooseClaudeCheckpoints(body, row, indexData, config)
-      : chooseCheckpoints(body, row, indexData, config);
+    const selection = chooseCheckpoints(
+      body,
+      row,
+      indexData,
+      config
+    );
 
     const {
       previous,
@@ -1896,9 +1522,6 @@ const server = http.createServer(async (req, res) => {
         reasoning_effort: body.reasoning_effort ?? null,
         include_reasoning: body.include_reasoning ?? null,
         prompt_cache_options: body.prompt_cache_options,
-        claude_cache_control: claude
-          ? { type: 'ephemeral', ttl: '1h' }
-          : undefined,
         breakpoints: marked.map(i => ({
           message_index: i,
           part_index: indexData.points.get(i)?.part_index ?? null
@@ -1927,27 +1550,6 @@ const server = http.createServer(async (req, res) => {
       body,
       trace
     );
-
-    // Claude saves only to its own model/policy namespace.
-    // GPT does not enter this branch.
-    if (claude) {
-      await saveClaudeCheckpoint({
-        body,
-        key,
-        selection,
-        after,
-        config,
-        result,
-        started,
-        trace
-      });
-
-      return;
-    }
-
-    /* =========================
-     * Original GPT save behavior
-     * ========================= */
 
     const { cached, written } = counts(result.usage);
 
@@ -1996,6 +1598,9 @@ const server = http.createServer(async (req, res) => {
       return;
     }
 
+    // Positive write usage is evidence that this request wrote
+    // cache, but the API does not identify each written boundary.
+    // Preserve the original explicit "position inferred" label.
     const checkpoint = {
       message_index: current,
       part_index: after.part_index,
@@ -2035,6 +1640,8 @@ const server = http.createServer(async (req, res) => {
         }
       );
     } catch (error) {
+      // The answer has already been forwarded.
+      // Do not turn a metadata-save failure into another answer.
       log('CACHE_STATE_SAVE_ERROR', {
         trace_id: trace,
         error: error.message
@@ -2064,7 +1671,7 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-// Request upload timeout, separate from inference timeout.
+// Request upload timeout, separate from upstream inference timeout.
 server.requestTimeout = 5 * 60 * 1000;
 server.headersTimeout = 60 * 1000;
 
@@ -2073,9 +1680,7 @@ server.listen(PORT, '0.0.0.0', () => {
     version: VERSION,
     port: PORT,
     max_body_mb: MAX_BODY_MB,
-    cache_ttl: '12h',
-    claude_cache_ttl: '1h',
-    claude_provider: ['anthropic'],
+    cache_ttl: '30m',
     max_checkpoints_per_group: MAX_CHECKPOINTS,
     pro_merged: false,
     diagnostics_enabled: DIAG
