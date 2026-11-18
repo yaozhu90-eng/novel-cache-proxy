@@ -1322,6 +1322,39 @@ const server = http.createServer(async (req, res) => {
       await forward(req, res, '/models', null, trace);
       return;
     }
+    if (path === '/search' && req.method === 'POST') {
+      const { body } = await readBody(req);
+      const q = typeof body?.query === 'string' ? body.query.trim() : '';
+      if (!q) return json(res, 400, { error: 'query is required', trace_id: trace });
+
+      const tv = await fetch('https://api.tavily.com/search', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          api_key: E.TAVILY_KEY,
+          query: q,
+          search_depth: 'basic',
+          max_results: 3,
+          include_answer: true,
+          include_raw_content: false
+        })
+      });
+
+      if (!tv.ok) return json(res, 502, { error: 'tavily_error', status: tv.status, trace_id: trace });
+
+      const d = await tv.json();
+      const rs = (Array.isArray(d.results) ? d.results : []).slice(0, 3).map(x => ({
+        title: String(x.title || '').slice(0, 120),
+        url: String(x.url || ''),
+        snippet: String(x.content || '').slice(0, 300)
+      }));
+
+      return json(res, 200, {
+        answer: String(d.answer || '').slice(0, 800),
+        results: rs,
+        trace_id: trace
+      });
+    }
 
     if (
       path !== '/v1/chat/completions' ||
