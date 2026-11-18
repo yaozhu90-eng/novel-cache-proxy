@@ -1356,6 +1356,45 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
+    if (path === '/extract' && req.method === 'POST') {
+      const { body } = await readBody(req);
+      const u = typeof body?.url === 'string' ? body.url.trim() : '';
+      if (!/^https?:\/\//i.test(u)) {
+        return json(res, 400, { error: 'url is required', trace_id: trace });
+      }
+
+      async function callExtract(depth) {
+        return fetch('https://api.tavily.com/extract', {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: E.TAVILY_KEY,
+            urls: [u],
+            extract_depth: depth,
+            include_images: false
+          })
+        });
+      }
+
+      let tv = await callExtract('basic');
+      if (!tv.ok) return json(res, 502, { error: 'tavily_error', status: tv.status, trace_id: trace });
+
+      let d = await tv.json();
+      let text = (d.results && d.results[0] && d.results[0].raw_content) || '';
+
+      if (text.length < 500) {
+        const tv2 = await callExtract('advanced');
+        if (tv2.ok) {
+          const d2 = await tv2.json();
+          const t2 = (d2.results && d2.results[0] && d2.results[0].raw_content) || '';
+          if (t2.length > text.length) text = t2;
+        }
+      }
+
+      if (!text) return json(res, 404, { error: 'no_content', trace_id: trace });
+
+      return json(res, 200, { url: u, chars: text.length, content: text.slice(0, 8000), trace_id: trace });
+    }
     if (
       path !== '/v1/chat/completions' ||
       req.method !== 'POST'
