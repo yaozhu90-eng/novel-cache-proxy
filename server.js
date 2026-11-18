@@ -1334,7 +1334,7 @@ const server = http.createServer(async (req, res) => {
           api_key: E.TAVILY_KEY,
           query: q,
           search_depth: 'basic',
-          max_results: 3,
+          max_results: 5,
           include_answer: true,
           include_raw_content: false
         })
@@ -1393,7 +1393,8 @@ const server = http.createServer(async (req, res) => {
 
       if (!text) return json(res, 404, { error: 'no_content', trace_id: trace });
 
-      const maxChars = Math.min(Math.max(Number(body?.max_chars) || 12000, 1000), 60000);
+            const maxChars = Math.min(Math.max(Number(body?.max_chars) || 100000, 1000), 200000);
+
       return json(res, 200, { url: u, chars: text.length, content: text.slice(0, maxChars), max_chars: maxChars, trace_id: trace });
 
     }
