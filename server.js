@@ -1393,7 +1393,7 @@ const server = http.createServer(async (req, res) => {
 
       if (!text) return json(res, 404, { error: 'no_content', trace_id: trace });
 
-      return json(res, 200, { url: u, chars: text.length, content: text.slice(0, 8000), trace_id: trace });
+      return json(res, 200, { url: u, chars: text.length, content: text.slice(0, 12000), trace_id: trace });
     }
     if (
       path !== '/v1/chat/completions' ||
