@@ -1328,6 +1328,7 @@ const server = http.createServer(async (req, res) => {
       if (!q) return json(res, 400, { error: 'query is required', trace_id: trace });
 
       const tv = await fetch('https://api.tavily.com/search', {
+        signal: AbortSignal.timeout(15000),
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
@@ -1340,8 +1341,10 @@ const server = http.createServer(async (req, res) => {
         })
       });
 
-      if (!tv.ok) return json(res, 502, { error: 'tavily_error', status: tv.status, trace_id: trace });
-
+           if (!tv.ok) {
+        const detail = await tv.text().catch(() => '');
+        return json(res, 502, { error: 'tavily_error', status: tv.status, detail: detail.slice(0, 300), trace_id: trace });
+      }
       const d = await tv.json();
       const rs = (Array.isArray(d.results) ? d.results : []).slice(0, 3).map(x => ({
         title: String(x.title || '').slice(0, 120),
@@ -1367,7 +1370,8 @@ const server = http.createServer(async (req, res) => {
         return fetch('https://api.tavily.com/extract', {
           method: 'POST',
           headers: { 'Content-Type': 'application/json' },
-          body: JSON.stringify({
+           signal: AbortSignal.timeout(30000),
+         body: JSON.stringify({
             api_key: E.TAVILY_KEY,
             urls: [u],
             extract_depth: depth,
@@ -1377,8 +1381,10 @@ const server = http.createServer(async (req, res) => {
       }
 
       let tv = await callExtract('basic');
-      if (!tv.ok) return json(res, 502, { error: 'tavily_error', status: tv.status, trace_id: trace });
-
+           if (!tv.ok) {
+        const detail = await tv.text().catch(() => '');
+        return json(res, 502, { error: 'tavily_error', status: tv.status, detail: detail.slice(0, 300), trace_id: trace });
+      }
       let d = await tv.json();
       let text = (d.results && d.results[0] && d.results[0].raw_content) || '';
 
