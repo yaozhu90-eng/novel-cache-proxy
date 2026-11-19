@@ -67,7 +67,7 @@ const CHECKPOINT_HISTORY_HOURS = envNumber(
   720
 );
 
-const CACHE_TTL_MS = 30 * 60 * 1000;
+const CACHE_TTL_MS = 12 * 60 * 60 * 1000;
 
 const HISTORY_MS =
   CHECKPOINT_HISTORY_HOURS * 60 * 60 * 1000;
@@ -327,7 +327,7 @@ function mark(messages, index) {
     ...message.content[partIndex],
     prompt_cache_breakpoint: {
       mode: 'explicit',
-      ttl: '30m'
+      ttl: '12h'
     }
   };
 
@@ -1283,7 +1283,7 @@ const server = http.createServer(async (req, res) => {
       return json(res, 200, {
         status: 'ok',
         version: VERSION,
-        requested_prompt_cache_ttl: '30m',
+        requested_prompt_cache_ttl: '12h',
         cache_mode: 'explicit',
         cache_strategy: 'matching-prefix-and-current',
         checkpoint_storage: 'multi-checkpoint-json-v2',
@@ -1406,7 +1406,7 @@ const server = http.createServer(async (req, res) => {
 
     body.prompt_cache_options = {
       mode: 'explicit',
-      ttl: '30m'
+      ttl: '12h'
     };
 
     if (body.stream === true) {
@@ -1680,7 +1680,7 @@ server.listen(PORT, '0.0.0.0', () => {
     version: VERSION,
     port: PORT,
     max_body_mb: MAX_BODY_MB,
-    cache_ttl: '30m',
+    cache_ttl: '12h',
     max_checkpoints_per_group: MAX_CHECKPOINTS,
     pro_merged: false,
     diagnostics_enabled: DIAG
