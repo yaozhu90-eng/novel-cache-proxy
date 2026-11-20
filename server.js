@@ -1,3 +1,15 @@
+/*
+ * novel-cache-proxy
+ * VERSION: route-isolated-v7-tail-breakpoint
+ *
+ * 相对 v6 的全部改动（只有三处）：
+ *   1. mark()                 增加"字符串内容"分支，使 assistant/tool 消息也能打点
+ *   2. chooseCheckpoints()    追加一个尾部断点（数组最后一条），不进仓库
+ *   3. VERSION                升级，用于确认部署生效
+ *
+ * 未改动：previous / current 的取值逻辑、Supabase 存取、心跳、路由钉死策略
+ */
+
 import http from 'node:http';
 import crypto from 'node:crypto';
 
@@ -20,6 +32,18 @@ function envNumber(name, fallback, min, max) {
   return value;
 }
 
+// Never throws: invalid values fall back to the default.
+function looseNumber(name, fallback, min, max) {
+  const raw = E[name];
+
+  if (raw === undefined || raw === '') return fallback;
+
+  const value = Number(raw);
+  if (!Number.isFinite(value)) return fallback;
+
+  return Math.min(max, Math.max(min, value));
+}
+
 const PORT = envNumber('PORT', 3000, 1, 65535);
 const API = E.OPENROUTER_API_KEY;
 const PASSWORD = E.PROXY_PASSWORD;
@@ -31,7 +55,7 @@ const ORIGIN = (
 ).replace(/\/+$/, '');
 
 const TABLE = 'cherry_cache_breakpoints';
-const VERSION = 'route-isolated-v6-keepalive';
+const VERSION = 'route-isolated-v7-tail-breakpoint';
 
 const DIAG = E.CACHE_DIAGNOSTICS === 'true';
 
@@ -67,25 +91,23 @@ const CHECKPOINT_HISTORY_HOURS = envNumber(
   720
 );
 
-// [PATCH 1] Keepalive tuning.
-// Write an SSE comment line when the stream has been silent this long.
-const KEEPALIVE_IDLE_MS = envNumber(
+// Keepalive tuning.
+const KEEPALIVE_IDLE_MS = looseNumber(
   'KEEPALIVE_IDLE_MS',
   15000,
   0,
   120000
 );
 
-// How often the keepalive timer checks for silence.
-const KEEPALIVE_TICK_MS = envNumber(
+const KEEPALIVE_TICK_MS = looseNumber(
   'KEEPALIVE_TICK_MS',
   5000,
   1000,
   60000
 );
 
-// [PATCH 2] Session identity source.
-// 'content' = original behaviour (hash of the leading messages).
+// Session identity source.
+// 'content' = hash of the leading messages (original behaviour).
 // 'client'  = prefer an explicit client-provided conversation id.
 const SESSION_SOURCE = String(E.SESSION_SOURCE || 'content')
   .trim()
@@ -288,7 +310,7 @@ function makeSessionId(messages) {
     hash(JSON.stringify(initialMessages)).slice(0, 40);
 }
 
-// [PATCH 2] Only consulted when SESSION_SOURCE === 'client'.
+// Only consulted when SESSION_SOURCE === 'client'.
 function clientSessionId(req, body) {
   const header = req.headers['x-session-id'];
 
@@ -376,6 +398,27 @@ function mark(messages, index) {
   if (!Number.isInteger(index)) return false;
 
   const message = messages[index];
+  if (!message) return false;
+
+  // [PATCH 1] Messages whose content is still a plain string
+  // (assistant / tool) can now receive a breakpoint too.
+  // Only this single message is rewritten; nothing before it changes.
+  if (
+    typeof message.content === 'string' &&
+    message.content
+  ) {
+    message.content = [{
+      type: 'text',
+      text: message.content,
+      prompt_cache_breakpoint: {
+        mode: 'explicit',
+        ttl: '12h'
+      }
+    }];
+
+    return true;
+  }
+
   const partIndex = lastTextPart(message);
 
   if (partIndex < 0) return false;
@@ -839,10 +882,26 @@ function chooseCheckpoints(body, row, indexData, config) {
     }
   }
 
+  // [PATCH 2] Tail breakpoint.
+  // Purely additive: it is not stored, it does not influence
+  // "previous" on the next request, and it never replaces the
+  // two breakpoints above. It only asks the upstream to cache
+  // up to the end of the current array.
+  const tail = body.messages.length - 1;
+
+  if (
+    Number.isInteger(tail) &&
+    !marked.includes(tail) &&
+    mark(body.messages, tail)
+  ) {
+    marked.push(tail);
+  }
+
   return {
     previous,
     current,
     marked,
+    tail,
     selected,
     fromState: Boolean(selected),
     stored_count: saved.length,
@@ -996,7 +1055,6 @@ async function forward(req, res, path, body, trace) {
   let transportEnded = false;
   let transportError = false;
 
-  // [PATCH 1] Keepalive bookkeeping.
   let keepaliveTimer = null;
   let keepalivesSent = 0;
   let lastWrite = Date.now();
@@ -1203,16 +1261,14 @@ async function forward(req, res, path, body, trace) {
       }
     }
 
-    // [PATCH 1] Send an SSE comment line when the stream goes quiet.
-    // Comment lines begin with ':' and are ignored by every SSE parser,
-    // so they never appear as content in the client.
+    // Send an SSE comment line when the stream goes quiet.
+    // Comment lines begin with ':' and are ignored by SSE parsers.
     // Only emitted at an event boundary, never inside a partial event.
     if (sse && KEEPALIVE_IDLE_MS > 0) {
       keepaliveTimer = setInterval(() => {
         if (res.destroyed || res.writableEnded) return;
         if (res.writableNeedDrain) return;
 
-        // Never split an in-flight event.
         if (
           eventData.length ||
           eventType ||
@@ -1248,7 +1304,7 @@ async function forward(req, res, path, body, trace) {
         await waitDrain(res, controller.signal);
       }
 
-      // [PATCH 1] Any real byte resets the keepalive countdown.
+      // Any real byte resets the keepalive countdown.
       lastWrite = Date.now();
 
       if (!body) continue;
@@ -1330,7 +1386,6 @@ async function forward(req, res, path, body, trace) {
   } finally {
     clearTimeout(timer);
 
-    // [PATCH 1] Stop the keepalive timer.
     if (keepaliveTimer) {
       clearInterval(keepaliveTimer);
       keepaliveTimer = null;
@@ -1392,6 +1447,8 @@ const server = http.createServer(async (req, res) => {
         requested_prompt_cache_ttl: '12h',
         cache_mode: 'explicit',
         cache_strategy: 'matching-prefix-and-current',
+        tail_breakpoint: true,
+        tail_breakpoint_stored: false,
         checkpoint_storage: 'multi-checkpoint-json-v2',
         max_body_mb: MAX_BODY_MB,
         max_checkpoints_per_group: MAX_CHECKPOINTS,
@@ -1499,8 +1556,6 @@ const server = http.createServer(async (req, res) => {
     // Compute before normalization, preserving original IDs.
     const baseSession = makeSessionId(body.messages);
 
-    // [PATCH 2] Optional explicit client session id.
-    // Default 'content' keeps the original behaviour byte-for-byte.
     const override = SESSION_SOURCE === 'client'
       ? clientSessionId(req, body)
       : null;
@@ -1572,6 +1627,7 @@ const server = http.createServer(async (req, res) => {
       previous,
       current,
       marked,
+      tail,
       selected,
       fromState
     } = selection;
@@ -1588,6 +1644,8 @@ const server = http.createServer(async (req, res) => {
         message_indexes: marked,
         previous_index: previous,
         current_index: current ?? null,
+        tail_index: tail ?? null,
+        tail_marked: marked.includes(tail),
         stored_checkpoints: selection.stored_count,
         matching_checkpoints: selection.matching_count,
         provider_only: body.provider.only,
@@ -1639,7 +1697,7 @@ const server = http.createServer(async (req, res) => {
         prompt_cache_options: body.prompt_cache_options,
         breakpoints: marked.map(i => ({
           message_index: i,
-          part_index: indexData.points.get(i)?.part_index ?? null
+          part_index: lastTextPart(body.messages[i])
         }))
       });
 
@@ -1651,7 +1709,10 @@ const server = http.createServer(async (req, res) => {
         prefix_hash_algorithm: 'sha256',
         breakpoints: marked.map(i => ({
           message_index: i,
-          part_index: indexData.points.get(i)?.part_index ?? null,
+          part_index: lastTextPart(body.messages[i]),
+          message_sha256: hash(
+            serializeMessage(body.messages[i])
+          ),
           prefix_without_markers_sha256:
             indexData.points.get(i)?.prefix_sha256 ?? null
         }))
@@ -1799,6 +1860,7 @@ server.listen(PORT, '0.0.0.0', () => {
     max_checkpoints_per_group: MAX_CHECKPOINTS,
     keepalive_idle_ms: KEEPALIVE_IDLE_MS,
     session_source: SESSION_SOURCE,
+    tail_breakpoint: true,
     pro_merged: false,
     diagnostics_enabled: DIAG
   });
